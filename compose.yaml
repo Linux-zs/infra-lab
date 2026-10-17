@@ -1,0 +1,48 @@
+name: infra-lab
+services:
+  api:
+    image: infra-lab-control:0.1.0
+    build:
+      context: .
+      dockerfile: deploy/Dockerfile
+    ports:
+      - "127.0.0.1:8088:8000"
+    volumes:
+      - state:/data
+      - /var/run/docker.sock:/var/run/docker.sock
+    environment:
+      INFRA_ALLOWED_HOSTS: localhost,127.0.0.1,testserver
+    mem_limit: 160m
+    cpus: 0.5
+    restart: unless-stopped
+    logging:
+      driver: json-file
+      options: {max-size: "5m", max-file: "2"}
+  worker:
+    image: infra-lab-control:0.1.0
+    command: ["python", "-m", "infra.worker"]
+    volumes:
+      - state:/data
+      - /var/run/docker.sock:/var/run/docker.sock
+    mem_limit: 160m
+    cpus: 0.5
+    restart: unless-stopped
+    logging:
+      driver: json-file
+      options: {max-size: "5m", max-file: "2"}
+  portal:
+    image: infra-lab-control:0.1.0
+    command: ["uvicorn", "infra.portal:app", "--host", "127.0.0.1", "--port", "8089"]
+    network_mode: host
+    volumes:
+      - state:/data
+      - /var/run/docker.sock:/var/run/docker.sock
+    mem_limit: 192m
+    cpus: 0.5
+    restart: unless-stopped
+    logging:
+      driver: json-file
+      options: {max-size: "5m", max-file: "2"}
+
+volumes:
+  state:
