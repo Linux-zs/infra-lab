@@ -11,6 +11,7 @@ export type TraceEvent = {
   time: number;
   evidence: string;
   data: {
+    response_version?: number | null;
     attempts?: {
       node_id?: string;
       address: string;
@@ -471,7 +472,8 @@ export default function ClientPanel({
           {store.records.map((r) => (
             <option key={r.id} value={r.id}>
               {r.source === "browser" ? "网站" : "单次"} · {r.method || "GET"}{" "}
-              {r.path} · {r.error ? "传输失败" : (r.status_code ?? r.status)} · {r.id.slice(0, 8)}
+              {r.path} · {r.error ? "传输失败" : (r.status_code ?? r.status)} ·{" "}
+              {r.id.slice(0, 8)}
               {r.trace ? " · 追踪" : ""}
             </option>
           ))}
@@ -593,7 +595,12 @@ export default function ClientPanel({
                   })}
                 </time>
                 <code>{event.node_id || event.source}</code>
-                <span>{eventName(event)}</span>
+                <span>
+                  {eventName(event)}
+                  {event.data.response_version != null
+                    ? ` · 响应 v${event.data.response_version}`
+                    : ""}
+                </span>
               </li>
             ))}
           </ol>

@@ -34,6 +34,30 @@ def execute(task, runtime):
                 (json.dumps(task["payload"]["topology"]), action["revision"], lab_id),
             )
         return {"applied_revision": action["revision"]}
+    if task["kind"] == "apply_response":
+        from .response_runtime import apply_response
+        response = task["payload"]["response"]
+        return apply_response(runtime, lab_id, action["node_id"], response["version"], response["config"], emit)
+    if task["kind"] == "reload":
+        container = runtime.node(lab_id, action["node_id"])
+        container.reload()
+        if container.labels.get("infra.kind") != "nginx" or container.status != "running":
+            raise RuntimeError("Nginx 未运行，无法重载")
+        result = container.exec_run(["cat", "/etc/nginx/nginx.conf"])
+        if result.exit_code:
+            raise RuntimeError("读取运行配置失败")
+        runtime.reload(container, result.output.decode(), emit)
+        return {"node_id": action["node_id"], "reloaded": True}
+    if task["kind"] == "delete_lab":
+        with db.connect() as con:
+            con.execute("UPDATE entries SET active=0,trace=0 WHERE lab_id=?", (lab_id,))
+        containers = runtime.containers(lab_id)
+        runtime.cleanup(lab_id, emit)
+        with db.connect() as con:
+            for container in containers:
+                con.execute("DELETE FROM meta WHERE key=?", (f"node-ip:{container.id}",))
+        db.erase_lab(lab_id)
+        return {"deleted": True}
     if task["kind"] == "cleanup":
         runtime.cleanup(lab_id, emit)
         with db.connect() as con:
@@ -57,6 +81,10 @@ def execute(task, runtime):
         result["applied_revision"] = lab["applied_revision"]
         db.request_status(task_id, "completed", result)
         return {"request_id": task_id}
+    if task["kind"] == "redis_command":
+        result = runtime.redis_command(lab_id, action)
+        emit(f"{action['node_id']} {action['redis_op']}: {result['value']}")
+        return result
     if task["kind"] == "load":
         # Read at execution time, not enqueue time: an earlier apply may have completed.
         with db.connect() as con:

@@ -13,6 +13,8 @@ from starlette.middleware.trustedhost import TrustedHostMiddleware
 from . import db
 from .entries import router as entries_router
 from .models import Action, SaveDraft, normalize, render_config
+from .responses import router as responses_router
+from .responses import saved
 
 
 @asynccontextmanager
@@ -23,6 +25,7 @@ async def lifespan(app):
 
 app = FastAPI(title="Infra Lab", lifespan=lifespan)
 app.include_router(entries_router)
+app.include_router(responses_router)
 app.add_middleware(
     TrustedHostMiddleware,
     allowed_hosts=os.getenv("INFRA_ALLOWED_HOSTS", "localhost,127.0.0.1,testserver").split(","),
@@ -132,18 +135,34 @@ def submit(lab_id: str, body: Action):
             if Action.model_validate(existing["payload"]["action"]).model_dump() != body.model_dump():
                 raise HTTPException(409, "同一请求标识不能用于不同操作")
             return existing
-        if body.revision != lab["revision"]:
+        if db.deleting(con, lab_id):
+            raise HTTPException(409, "实验正在删除")
+        if body.kind == "delete_lab" and con.execute("SELECT 1 FROM tasks WHERE lab_id=? AND status IN ('queued','running')", (lab_id,)).fetchone():
+            raise HTTPException(409, "请等待当前实验任务结束后再删除")
+        if body.kind != "apply_response" and body.revision != lab["revision"]:
             raise HTTPException(409, "草稿版本已改变")
         topology = lab["draft"] if body.kind == "apply" else lab["applied"]
-        if body.kind in ("start", "stop", "load", "client_request"):
+        if body.kind in ("start", "stop", "load", "client_request", "redis_command", "apply_response", "reload"):
             node = next((n for n in (topology or {}).get("nodes", []) if n["id"] == body.node_id), None)
             if not node:
                 raise HTTPException(422, "请选择已部署的节点")
             if body.kind in ("load", "client_request") and node["kind"] != "nginx":
                 raise HTTPException(422, "请求测试只允许指向本实验 Nginx")
+            if body.kind == "redis_command" and node["kind"] != "redis":
+                raise HTTPException(422, "请选择本实验已部署的 Redis 节点")
+            if body.kind == "reload" and node["kind"] != "nginx":
+                raise HTTPException(422, "重载仅支持 Nginx")
+            if body.kind == "apply_response" and node["kind"] != "app":
+                raise HTTPException(422, "响应配置仅支持应用节点")
+        response = None
+        if body.kind == "apply_response":
+            response = saved(con, lab_id, body.node_id, body.response_version) if body.response_version else None
+            if not response:
+                raise HTTPException(422, "请选择已保存的响应配置版本")
         task_id = db.uid()
         payload = {
             "action": body.model_dump(),
+            "response": response,
             "topology": topology,
             "applied_revision": lab["applied_revision"],
         }
@@ -194,7 +213,13 @@ async def events(lab_id: str, request: Request):
 
     async def stream():
         while not await request.is_disconnected():
-            data = {"lab": get_lab(lab_id), "tasks": tasks(lab_id), "health": health()}
+            try:
+                data = {"lab": get_lab(lab_id), "tasks": tasks(lab_id), "health": health()}
+            except HTTPException as exc:
+                if exc.status_code != 404:
+                    raise
+                yield 'event: deleted\ndata: {}\n\n'
+                return
             yield f"event: snapshot\ndata: {json.dumps(data)}\n\n"
             await asyncio.sleep(2)
 

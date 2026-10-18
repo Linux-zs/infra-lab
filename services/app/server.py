@@ -5,10 +5,32 @@ import random
 import time
 import uuid
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
+from pathlib import Path
+import hashlib
+from response_config import DEFAULT, validate
 from urllib.parse import parse_qs, urlsplit
 
 
+def response_snapshot():
+    path = Path('/tmp/infra-response.json')
+    if not path.exists():
+        return {"version": 0, "config": dict(DEFAULT), "digest": None}
+    data = json.loads(path.read_text(encoding='utf-8'))
+    data['config'] = validate(data['config'])
+    digest = hashlib.sha256(json.dumps(data['config'], sort_keys=True, ensure_ascii=True).encode()).hexdigest()
+    if digest != data['digest']:
+        raise ValueError('响应配置校验和不一致')
+    return data
+
+
 class Handler(BaseHTTPRequestHandler):
+    def do_PUT(self):
+        self.handle_request()
+
+    do_PATCH = do_PUT
+    do_DELETE = do_PUT
+    do_OPTIONS = do_PUT
+
     def do_HEAD(self):
         self.handle_request(head=True)
 
@@ -19,8 +41,14 @@ class Handler(BaseHTTPRequestHandler):
         self.handle_request()
 
     def handle_request(self, head=False):
+        try:
+            response = response_snapshot()
+            response_error = None
+        except Exception as exc:
+            response = {"version": None, "config": dict(DEFAULT), "digest": None}
+            response_error = str(exc)
         payload = b""
-        if self.command == "POST":
+        if self.command not in ("GET", "HEAD"):
             length = int(self.headers.get("Content-Length", "0"))
             if length > 1048576:
                 self.send_error(413)
@@ -41,6 +69,7 @@ class Handler(BaseHTTPRequestHandler):
                             "kind": kind,
                             "request_id": request_id,
                             "attempt_id": attempt,
+                            "response_version": response["version"],
                             "node": os.getenv("NODE_ID", "unknown"),
                             "time": time.time(),
                             **extra,
@@ -50,8 +79,38 @@ class Handler(BaseHTTPRequestHandler):
                 )
 
         event("app.received", path=self.path)
+        if self.path != "/__infra_health" and response_error:
+            self.send_error(503, "Response configuration unavailable")
+            event("app.response_aborted", status=503)
+            return
+        if self.path != "/__infra_health" and response["config"]["mode"] == "custom":
+            config = response["config"]
+            event("app.processing")
+            time.sleep(config["delay_ms"] / 1000)
+            raw = config["body"].encode("utf-8")
+            code = config["status"]
+            self.send_response(code)
+            self.send_header("Content-Type", {"json": "application/json", "text": "text/plain", "html": "text/html"}[config["format"]] + "; charset=utf-8")
+            if code not in (204, 304):
+                self.send_header("Content-Length", str(len(raw)))
+            self.send_header("X-Request-ID", request_id)
+            self.send_header("X-Infra-Node", os.getenv("NODE_ID", "unknown"))
+            self.send_header("X-Infra-Response-Version", str(response["version"]))
+            if not any(h["name"].lower() == "cache-control" for h in config["headers"]):
+                self.send_header("Cache-Control", "no-store")
+            for header in config["headers"]:
+                self.send_header(header["name"], header["value"])
+            self.end_headers()
+            try:
+                if not head:
+                    self.wfile.write(raw)
+                self.wfile.flush()
+                event("app.response_written", status=code)
+            except (BrokenPipeError, ConnectionResetError):
+                event("app.response_aborted", status=code)
+            return
         if self.path == "/__infra_health":
-            code, body = 200, {"health": "ok"}
+            code, body = 200, {"health": "ok", "response_version": response["version"], "response_digest": response["digest"], "response_error": response_error}
         else:
             event("app.processing")
             time.sleep(int(os.getenv("DELAY_MS", "0")) / 1000)
@@ -110,6 +169,8 @@ class Handler(BaseHTTPRequestHandler):
         self.send_header("Content-Type", content_type)
         self.send_header("Content-Length", str(len(raw)))
         self.send_header("X-Request-ID", request_id)
+        self.send_header("X-Infra-Node", os.getenv("NODE_ID", "unknown"))
+        self.send_header("X-Infra-Response-Version", str(response["version"]))
         self.send_header("Cache-Control", "no-store")
         for key, value in extra_headers:
             self.send_header(key, value)
@@ -123,4 +184,5 @@ class Handler(BaseHTTPRequestHandler):
             event("app.response_aborted", status=code)
 
 
-ThreadingHTTPServer(("0.0.0.0", 8080), Handler).serve_forever()
+if __name__ == "__main__":
+    ThreadingHTTPServer(("0.0.0.0", 8080), Handler).serve_forever()

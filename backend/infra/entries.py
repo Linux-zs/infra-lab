@@ -35,6 +35,8 @@ def list_entries(lab_id: str):
 def create_entry(lab_id: str, body: EntryInput):
     with db.connect() as con:
         con.execute("BEGIN IMMEDIATE")
+        if db.deleting(con, lab_id):
+            raise HTTPException(409, "实验正在删除")
         lab = db.unpack(con.execute("SELECT * FROM labs WHERE id=?", (lab_id,)).fetchone())
         if not lab or not any(
             n["id"] == body.node_id and n["kind"] == "nginx" for n in (lab["applied"] or {}).get("nodes", [])

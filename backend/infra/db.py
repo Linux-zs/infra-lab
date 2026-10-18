@@ -35,6 +35,14 @@ def connect():
 def init():
     with connect() as con:
         con.executescript("""
+        CREATE TABLE IF NOT EXISTS response_versions (
+          lab_id TEXT NOT NULL,node_id TEXT NOT NULL,version INTEGER NOT NULL,
+          config TEXT NOT NULL,created_at REAL NOT NULL,PRIMARY KEY(lab_id,node_id,version)
+        );
+        CREATE TABLE IF NOT EXISTS response_state (
+          lab_id TEXT NOT NULL,node_id TEXT NOT NULL,applied_version INTEGER NOT NULL DEFAULT 0,
+          observed_version INTEGER,observed_at REAL,error TEXT,PRIMARY KEY(lab_id,node_id)
+        );
         CREATE TABLE IF NOT EXISTS labs (
           id TEXT PRIMARY KEY, name TEXT NOT NULL, revision INTEGER NOT NULL DEFAULT 0,
           draft TEXT NOT NULL, applied TEXT, applied_revision INTEGER,
@@ -106,6 +114,7 @@ def finish(task_id, status, result=None):
 
 def request_event(request_id, source, kind, node_id=None, evidence="live", timestamp=None, data=None):
     with connect() as con:
+        con.execute("BEGIN IMMEDIATE")
         request = con.execute("SELECT lab_id,trace FROM client_requests WHERE id=?", (request_id,)).fetchone()
         if not request or not request["trace"]:
             return
@@ -148,3 +157,16 @@ def request_status(request_id, status, result=None):
             con.execute("DELETE FROM browser_requests WHERE request_id=?", (old_id,))
             con.execute("DELETE FROM request_events WHERE request_id=?", (old_id,))
             con.execute("DELETE FROM client_requests WHERE id=?", (old_id,))
+
+
+def deleting(con, lab_id):
+    return con.execute("SELECT 1 FROM tasks WHERE lab_id=? AND kind='delete_lab' AND status IN ('queued','running')", (lab_id,)).fetchone() is not None
+
+
+def erase_lab(lab_id):
+    with connect() as con:
+        con.execute("BEGIN IMMEDIATE")
+        con.execute("DELETE FROM browser_requests WHERE request_id IN (SELECT id FROM client_requests WHERE lab_id=?)", (lab_id,))
+        for table in ("request_events", "client_requests", "entries", "response_versions", "response_state", "revisions", "tasks"):
+            con.execute(f"DELETE FROM {table} WHERE lab_id=?", (lab_id,))
+        con.execute("DELETE FROM labs WHERE id=?", (lab_id,))

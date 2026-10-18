@@ -1,6 +1,7 @@
 export type LabNode = {
   id: string;
-  kind: "nginx" | "app";
+  kind: "nginx" | "app" | "redis";
+  replica_of?: string | null;
   position: { x: number; y: number };
   memory_mb: number;
   cpu: number;
@@ -25,6 +26,22 @@ export type Observation = {
   observed_at: number;
   client_trace?: boolean;
   browser_site?: boolean;
+  custom_response?: boolean;
+  response?: {
+    available: boolean;
+    version?: number;
+    mode?: "website" | "custom";
+    status?: number;
+    delay_ms?: number;
+    observed_at: number;
+    error?: string;
+  } | null;
+  redis?: {
+    available: boolean;
+    fields?: Record<string, string>;
+    error?: string;
+    observed_at: number;
+  } | null;
   image?: string;
 };
 export type Lab = {
@@ -62,9 +79,18 @@ export type Task = {
   kind: string;
   status: string;
   created_at: number;
-  payload: { action: { revision: number } };
+  payload: {
+    action: {
+      revision: number;
+      node_id?: string;
+      redis_op?: string;
+      response_version?: number;
+    };
+  };
   logs: { time: number; message: string }[];
-  result: (LoadResult & { error?: string }) | null;
+  result:
+    | (LoadResult & { error?: string; value?: string | number | null })
+    | null;
 };
 export type Health = {
   api: string;
@@ -91,7 +117,11 @@ export async function api<T>(
   }
   return response.json();
 }
-export function newNode(kind: "nginx" | "app", x: number, y: number): LabNode {
+export function newNode(
+  kind: "nginx" | "app" | "redis",
+  x: number,
+  y: number,
+): LabNode {
   return {
     id: `${kind}-${crypto.randomUUID().slice(0, 6)}`,
     kind,

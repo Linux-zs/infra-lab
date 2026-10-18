@@ -159,7 +159,7 @@ class Trace:
                         "nginx.completed",
                         node_id,
                         "posthoc",
-                        data={"attempts": attempts, "status": event.get("status")},
+                        data={"attempts": attempts, "status": event.get("status"), "response_version": event.get("response_version")},
                     )
                 elif source == "app" and event.get("infra_trace") == 1:
                     kind = event.get("kind")
@@ -181,7 +181,7 @@ class Trace:
                         kind,
                         node_id,
                         timestamp=event.get("time"),
-                        data={"attempt_id": event.get("attempt_id"), "status": event.get("status")},
+                        data={"attempt_id": event.get("attempt_id"), "status": event.get("status"), "response_version": event.get("response_version")},
                     )
 
     async def run(self):
@@ -238,6 +238,10 @@ async def proxy(request: Request, path: str):
     query = request.scope["query_string"].decode("ascii")
     relative = raw_path + ("?" + query if query else "")
     with db.connect() as con:
+        con.execute("BEGIN IMMEDIATE")
+        if not con.execute("SELECT 1 FROM entries WHERE id=? AND active=1", (entry["id"],)).fetchone() or db.deleting(con, entry["lab_id"]):
+            slots.release()
+            return PlainTextResponse("入口已撤销或实验正在删除", status_code=410)
         con.execute(
             "INSERT INTO client_requests VALUES(?,?,?,?,?,?,NULL,?,?)",
             (

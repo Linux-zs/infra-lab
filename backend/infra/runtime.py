@@ -10,6 +10,8 @@ import time
 import docker
 from docker.errors import NotFound
 
+from .redis_runtime import cli, command, redis_config, replication
+
 OWNER = "infra-lab-v1"
 
 
@@ -24,18 +26,19 @@ def filters(lab_id):
 def fingerprint(node):
     return hashlib.sha256(
         json.dumps(
-            {k: v for k, v in node.items() if k not in ("position", "config", "mode")}, sort_keys=True
+            {k: v for k, v in node.items() if k not in ("position", "config", "mode", "replica_of")}, sort_keys=True
         ).encode()
     ).hexdigest()[:16]
 
 
-def archive(path, content):
+def archive(path, content, uid=0):
     output = io.BytesIO()
     with tarfile.open(fileobj=output, mode="w") as tar:
         data = content.encode()
         info = tarfile.TarInfo(path)
         info.size = len(data)
         info.mode = 0o644
+        info.uid = info.gid = uid
         tar.addfile(info, io.BytesIO(data))
     return output.getvalue()
 
@@ -45,7 +48,14 @@ class Runtime:
         self.client = docker.from_env(timeout=15)
         self.client.ping()
         self.nginx_image = os.getenv("INFRA_NGINX_IMAGE", "nginx:1.28.0-alpine")
-        self.app_image = os.getenv("INFRA_APP_IMAGE", "infra-lab-app:1.2.0")
+        self.redis_image = os.getenv("INFRA_REDIS_IMAGE", "redis:7.4.7-alpine")
+        self.app_image = os.getenv("INFRA_APP_IMAGE", "infra-lab-app:1.3.0")
+
+    def image_for(self, kind):
+        return {"nginx": self.nginx_image, "app": self.app_image, "redis": self.redis_image}[kind]
+
+    def redis_command(self, lab_id, action):
+        return command(self, lab_id, action)
 
     def close(self):
         self.client.close()
@@ -82,7 +92,7 @@ class Runtime:
             self.client.images.pull(image)
 
     def create(self, lab_id, node, name=None, role="node", command=None):
-        image = self.nginx_image if node["kind"] == "nginx" else self.app_image
+        image = self.image_for(node["kind"])
         self.ensure_image(image)
         network = self.network(lab_id)
         options = dict(
@@ -102,7 +112,7 @@ class Runtime:
                     "infra.role": role,
                     "infra.spec": fingerprint(node),
                     "infra.kind": node["kind"],
-                    "infra.capabilities": "client-page-trace-v2" if node["kind"] == "app" else "",
+                    "infra.capabilities": "client-page-trace-v3" if node["kind"] == "app" else "",
                 },
             ),
             log_config=docker.types.LogConfig(type="json-file", config={"max-size": "5m", "max-file": "2"}),
@@ -119,6 +129,13 @@ class Runtime:
                     "retries": 2,
                     "start_period": 3_000_000_000,
                 },
+            )
+        elif node["kind"] == "redis":
+            options.update(
+                user="999:999", entrypoint=["redis-server"], command=["/tmp/redis.conf"],
+                working_dir="/tmp", tmpfs={"/data": "rw,noexec,nosuid,size=1m"},
+                healthcheck={"test": ["CMD", "redis-cli", "ping"], "interval": 5_000_000_000,
+                             "timeout": 2_000_000_000, "retries": 2, "start_period": 3_000_000_000},
             )
         else:
             options.update(
@@ -138,6 +155,15 @@ class Runtime:
             network.connect(container, aliases=[node["id"]])
         if node["kind"] == "nginx":
             container.put_archive("/etc/nginx", archive("nginx.conf", node["config"]))
+        if node["kind"] == "redis":
+            container.put_archive("/tmp", archive("redis.conf", redis_config(node)))
+        if node["kind"] == "app" and role == "node":
+            from . import db
+            from .response_runtime import envelope
+            with db.connect() as con:
+                row = con.execute("SELECT v.version,v.config FROM response_state s JOIN response_versions v ON v.lab_id=s.lab_id AND v.node_id=s.node_id AND v.version=s.applied_version WHERE s.lab_id=? AND s.node_id=?", (lab_id, node["id"])).fetchone()
+            if row:
+                container.put_archive("/tmp", archive("infra-response.json", json.dumps(envelope(row[0], json.loads(row[1]))), uid=65534))
         return container
 
     def validate(self, lab_id, node, task_id, emit):
@@ -203,17 +229,27 @@ class Runtime:
             c.labels["infra.node"]: c for c in self.containers(lab_id) if c.labels.get("infra.role") == "node"
         }
         # Backends must exist for nginx -t to resolve upstream names.
-        for node in sorted(nodes, key=lambda n: n["kind"] == "nginx"):
+        # Redis sources precede replicas; topology validation already rejects cycles.
+        by_id = {n["id"]: n for n in nodes}
+        def rank(node):
+            if node["kind"] == "nginx":
+                return 100
+            depth, parent = 0, node.get("replica_of")
+            while parent:
+                depth += 1
+                parent = by_id[parent].get("replica_of")
+            return depth
+        for node in sorted(nodes, key=rank):
             current = existing.get(node["id"])
             if node["kind"] == "nginx":
                 self.validate(lab_id, node, task_id, emit)
-            expected_image = self.nginx_image if node["kind"] == "nginx" else self.app_image
+            expected_image = self.image_for(node["kind"])
             if current and (
                 current.labels.get("infra.spec") != fingerprint(node)
                 or current.attrs["Config"]["Image"] != expected_image
                 or (
                     node["kind"] == "app"
-                    and current.labels.get("infra.capabilities") != "client-page-trace-v2"
+                    and current.labels.get("infra.capabilities") != "client-page-trace-v3"
                 )
             ):
                 emit(f"{node['id']} 参数改变，重建此实例")
@@ -232,6 +268,23 @@ class Runtime:
                 elif node["kind"] == "nginx":
                     self.reload(current, node["config"], emit)
             self.ready(current)
+            if node["kind"] == "redis":
+                previous = current.exec_run(["cat", "/tmp/redis.conf"]).output.decode()
+                current.put_archive("/tmp", archive("redis.conf", redis_config(node)))
+                try:
+                    source = node.get("replica_of")
+                    fields = replication(current)
+                    if not fields["available"]:
+                        raise RuntimeError(fields["error"])
+                    actual = fields["fields"]
+                    if source and (actual.get("role") != "slave" or actual.get("master_host") != source):
+                        cli(current, "REPLICAOF", source, "6379")
+                    elif not source and actual.get("role") != "master":
+                        cli(current, "REPLICAOF", "NO", "ONE")
+                    emit(f"{node['id']} 复制配置已设置，实际同步状态见观测")
+                except Exception:
+                    current.put_archive("/tmp", archive("redis.conf", previous))
+                    raise
             emit(f"{node['id']} 健康检查通过")
         keep = {n["id"] for n in nodes}
         for node_id, container in existing.items():
@@ -260,6 +313,10 @@ class Runtime:
                     )
                 previous = con.execute("SELECT value FROM meta WHERE key=?", (key,)).fetchone()
                 last_ip = json.loads(previous[0]) if previous else None
+            response_state = None
+            if c.labels.get("infra.capabilities") == "client-page-trace-v3" and c.status == "running":
+                from .response_runtime import reconcile
+                response_state = reconcile(lab_id, c.labels["infra.node"], c)
             stats = c.stats(stream=False, one_shot=True) if c.status == "running" else {}
             result.append(
                 {
@@ -274,8 +331,11 @@ class Runtime:
                     "spec": c.labels.get("infra.spec"),
                     "image": c.attrs["Config"]["Image"],
                     "client_trace": c.labels.get("infra.capabilities")
-                    in ("client-page-trace-v1", "client-page-trace-v2"),
-                    "browser_site": c.labels.get("infra.capabilities") == "client-page-trace-v2",
+                    in ("client-page-trace-v1", "client-page-trace-v2", "client-page-trace-v3"),
+                    "browser_site": c.labels.get("infra.capabilities") in ("client-page-trace-v2", "client-page-trace-v3"),
+                    "custom_response": c.labels.get("infra.capabilities") == "client-page-trace-v3",
+                    "response": response_state,
+                    "redis": replication(c) if c.labels.get("infra.kind") == "redis" and c.status == "running" else None,
                     "observed_at": time.time(),
                 }
             )

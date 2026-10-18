@@ -11,7 +11,8 @@ class Position(BaseModel):
 
 class Node(BaseModel):
     id: str = Field(pattern=r"^[a-z][a-z0-9-]{0,30}$")
-    kind: Literal["nginx", "app"]
+    kind: Literal["nginx", "app", "redis"]
+    replica_of: str | None = Field(default=None, pattern=r"^[a-z][a-z0-9-]{0,30}$")
     position: Position
     memory_mb: int = Field(default=128, ge=64, le=512)
     cpu: float = Field(default=0.5, ge=0.1, le=1)
@@ -38,14 +39,28 @@ class Topology(BaseModel):
         if len(nodes) != len(self.nodes):
             raise ValueError("节点 ID 重复")
         seen = set()
+        parents = {}
         for edge in self.edges:
             if edge.source not in nodes or edge.target not in nodes:
                 raise ValueError("连线端点不存在")
-            if nodes[edge.source].kind != "nginx" or nodes[edge.target].kind != "app":
-                raise ValueError("仅支持 Nginx → HTTP 应用")
+            kinds = (nodes[edge.source].kind, nodes[edge.target].kind)
+            if kinds not in (("nginx", "app"), ("redis", "redis")):
+                raise ValueError("仅支持 Nginx → HTTP 应用、Redis 主 → 从")
+            if kinds == ("redis", "redis"):
+                if edge.target in parents:
+                    raise ValueError("Redis 从节点只能有一个复制来源")
+                parents[edge.target] = edge.source
             if (edge.source, edge.target) in seen:
                 raise ValueError("连线重复")
             seen.add((edge.source, edge.target))
+        for child in parents:
+            visited = set()
+            current = child
+            while current in parents:
+                if current in visited:
+                    raise ValueError("Redis 复制关系不能形成环")
+                visited.add(current)
+                current = parents[current]
         return self
 
 
@@ -56,14 +71,19 @@ class SaveDraft(BaseModel):
 
 class Action(BaseModel):
     request_id: str = Field(min_length=8, max_length=80, pattern=r"^[a-zA-Z0-9-]+$")
-    kind: Literal["apply", "start", "stop", "cleanup", "load", "start_lab", "stop_lab", "client_request"]
+    kind: Literal["apply", "start", "stop", "cleanup", "load", "start_lab", "stop_lab", "client_request", "redis_command", "apply_response", "reload", "delete_lab"]
     revision: int
+    response_version: int | None = Field(default=None, ge=1)
     node_id: str | None = None
     count: int = Field(default=100, ge=1, le=1000)
     concurrency: int = Field(default=5, ge=1, le=20)
     duration: int = Field(default=30, ge=1, le=60)
     path: str = Field(default="/page", max_length=2048)
     trace: bool = False
+    redis_op: Literal["GET", "SET", "DEL", "TTL", "DBSIZE", "PING"] = "GET"
+    key: str = Field(default="demo", min_length=1, max_length=256)
+    value: str = Field(default="", max_length=4096)
+    ttl: int = Field(default=0, ge=0, le=86400)
 
     @model_validator(mode="after")
     def relative_path(self):
@@ -126,6 +146,10 @@ http {{
 def normalize(topology: Topology) -> dict:
     data = topology.model_dump()
     for node in data["nodes"]:
+        if node["kind"] == "redis":
+            node["replica_of"] = next((e["source"] for e in data["edges"] if e["target"] == node["id"]), None)
+        else:
+            node.pop("replica_of", None)
         if node["kind"] == "nginx" and node["mode"] == "generated":
             node["config"] = render_config(topology, node["id"])
     return data

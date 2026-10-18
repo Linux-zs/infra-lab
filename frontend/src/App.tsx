@@ -12,6 +12,8 @@ import {
 } from "@xyflow/react";
 import "@xyflow/react/dist/style.css";
 import Editor from "@monaco-editor/react";
+import ResponseSettings from "./ResponseSettings";
+import RedisPanel from "./RedisPanel";
 import ConfigDiff from "./ConfigDiff";
 import ClientPanel, { useClientRequests, eventName } from "./ClientPanel";
 import {
@@ -68,10 +70,14 @@ const taskText: Record<string, string> = {
   start: "启动节点",
   stop: "停止节点",
   cleanup: "清理实验",
+  delete_lab: "删除实验",
   load: "请求实验",
   start_lab: "启动实验",
   stop_lab: "停止实验",
   client_request: "客户端请求",
+  redis_command: "Redis 操作",
+  apply_response: "应用响应配置",
+  reload: "重载 Nginx",
 };
 const clock = (time?: number | null) =>
   time
@@ -97,24 +103,46 @@ function ServiceNode({ data, selected }: NodeProps<Node<FlowData>>) {
       <Handle
         type="target"
         position={Position.Left}
-        isConnectable={spec.kind === "app"}
+        isConnectable={spec.kind !== "nginx"}
       />
       {data.traceLabel && (
         <div className="node-trace-label">{data.traceLabel}</div>
       )}
       <div className="node-top">
         <span className="node-icon">
-          {spec.kind === "nginx" ? <Cable size={20} /> : <Box size={20} />}
+          {spec.kind === "nginx" ? (
+            <Cable size={20} />
+          ) : spec.kind === "redis" ? (
+            <Database size={20} />
+          ) : (
+            <Box size={20} />
+          )}
         </span>
         <span className="node-type">
-          {spec.kind === "nginx" ? "Nginx" : "HTTP 应用"}
+          {spec.kind === "nginx"
+            ? "Nginx"
+            : spec.kind === "redis"
+              ? "Redis"
+              : "HTTP 应用"}
         </span>
       </div>
       <strong>{spec.id}</strong>
       <div className="node-sub">
         {spec.kind === "nginx"
           ? "反向代理 · 8080"
-          : `延迟 ${spec.delay_ms} ms · 错误 ${spec.error_rate}%`}
+          : spec.kind === "redis"
+            ? stale ||
+              observation?.status !== "running" ||
+              !observation?.redis?.available
+              ? "角色未知 · 6379"
+              : observation.redis.fields?.role === "master"
+                ? "主节点 · 6379"
+                : `从节点 · ${observation.redis.fields?.master_link_status === "up" ? "复制已连接" : "复制断开"}`
+            : !stale &&
+                observation?.response?.available &&
+                observation.response.mode === "custom"
+              ? `自定义 HTTP ${observation.response.status} · ${observation.response.delay_ms} ms · v${observation.response.version}`
+              : `默认网站 · 延迟 ${spec.delay_ms} ms`}
       </div>
       <div className="node-bottom">
         <span
@@ -123,7 +151,7 @@ function ServiceNode({ data, selected }: NodeProps<Node<FlowData>>) {
         {observation?.status === "exited" && !stale ? "已停止" : status}
         <span>{spec.memory_mb} MB</span>
       </div>
-      {spec.kind === "nginx" && (
+      {spec.kind !== "app" && (
         <Handle type="source" position={Position.Right} />
       )}
     </div>
@@ -196,14 +224,14 @@ export default function App() {
   const [error, setError] = useState("");
   const [realtime, setRealtime] = useState(false);
   const [panel, setPanel] = useState<
-    "client" | "requests" | "results" | "tasks" | "logs"
+    "client" | "requests" | "results" | "tasks" | "logs" | "redis"
   >("client");
   const [traceEnabled, setTraceEnabled] = useState(false);
   const [replay, setReplay] = useState(-1);
   const clientStore = useClientRequests(lab?.id);
   const [logs, setLogs] = useState("选择已部署的节点，读取真实容器日志。");
   const [diff, setDiff] = useState<string | null>(null);
-  const [modal, setModal] = useState<"cleanup" | "new" | null>(null);
+  const [modal, setModal] = useState<"cleanup" | "delete" | "new" | null>(null);
   const [name, setName] = useState("负载均衡实验");
   const [count, setCount] = useState(120);
   const [concurrency, setConcurrency] = useState(4);
@@ -236,7 +264,8 @@ export default function App() {
   }, [fitView]);
   useEffect(() => {
     const timer = setTimeout(() => {
-      if (topoRef.current.nodes.length) void fitView({ padding: 0.18, maxZoom: 1 });
+      if (topoRef.current.nodes.length)
+        void fitView({ padding: 0.18, maxZoom: 1 });
     }, 150);
     return () => clearTimeout(timer);
   }, [lab?.id, topology.nodes.length, fitView]);
@@ -316,6 +345,7 @@ export default function App() {
   useEffect(() => {
     if (!lab?.id) return;
     const events = new EventSource(`/api/labs/${lab.id}/events`);
+    let removedOnce = false;
     events.addEventListener("snapshot", (event) => {
       const value = JSON.parse((event as MessageEvent).data);
       if (!dirtyRef.current && draftRevision.current !== value.lab.revision) {
@@ -327,12 +357,37 @@ export default function App() {
       setHealth(value.health);
       setConnected(true);
     });
-    events.onerror = () => setConnected(false);
+    const removed = async () => {
+      if (removedOnce) return;
+      removedOnce = true;
+      events.close();
+      const values = await api<Lab[]>("/labs");
+      setLabs(values);
+      if (values[0]) selectLab(values[0]);
+      else {
+        setLab(null);
+        setTopology(empty);
+        setSelected(null);
+        setTasks([]);
+        setDirty(false);
+        setTraceEnabled(false);
+        setConnected(false);
+        setPanel("client");
+        setLogs("选择已部署的节点，读取真实容器日志。");
+      }
+      setModal(null);
+    };
+    events.addEventListener("deleted", () => void removed().catch(e => setError(String(e))));
+    events.onerror = () => {
+      setConnected(false);
+      // Also handles reconnect after deletion completed while this tab was offline.
+      void api<Lab[]>("/labs").then(values => {if (!values.some(v => v.id === lab.id)) void removed();}).catch(() => {});
+    };
     return () => {
       events.close();
       setConnected(false);
     };
-  }, [lab?.id]);
+  }, [lab?.id, selectLab]);
   useEffect(() => {
     const warn = (event: BeforeUnloadEvent) => {
       if (dirty) event.preventDefault();
@@ -379,13 +434,16 @@ export default function App() {
     });
     setTasks((values) => [task, ...values]);
     if (kind === "load") setResultTaskId("");
-    setPanel(
-      kind === "client_request"
-        ? "client"
-        : kind === "load"
-          ? "results"
-          : "tasks",
-    );
+    if (kind !== "apply_response")
+      setPanel(
+        kind === "redis_command"
+          ? "redis"
+          : kind === "client_request"
+            ? "client"
+            : kind === "load"
+              ? "results"
+              : "tasks",
+      );
     if (kind === "client_request") clientStore.select(task.id);
   }
   function change(next: Topology, structural = false) {
@@ -402,7 +460,10 @@ export default function App() {
       ),
     });
   }
-  function add(kind: "nginx" | "app", position?: { x: number; y: number }) {
+  function add(
+    kind: "nginx" | "app" | "redis",
+    position?: { x: number; y: number },
+  ) {
     if (!lab || topology.nodes.length >= 10) return;
     const item = newNode(
       kind,
@@ -416,13 +477,32 @@ export default function App() {
     if (
       !edge.source ||
       !edge.target ||
-      topology.nodes.find((n) => n.id === edge.source)?.kind !== "nginx" ||
-      topology.nodes.find((n) => n.id === edge.target)?.kind !== "app" ||
+      !(
+        (topology.nodes.find((n) => n.id === edge.source)?.kind === "nginx" &&
+          topology.nodes.find((n) => n.id === edge.target)?.kind === "app") ||
+        (topology.nodes.find((n) => n.id === edge.source)?.kind === "redis" &&
+          topology.nodes.find((n) => n.id === edge.target)?.kind === "redis")
+      ) ||
       topology.edges.some(
         (e) => e.source === edge.source && e.target === edge.target,
       )
     )
       return;
+    if (topology.nodes.find((n) => n.id === edge.target)?.kind === "redis") {
+      const parents = new Map(topology.edges.map((e) => [e.target, e.source]));
+      if (parents.has(edge.target)) {
+        setError("从节点只能有一个复制来源，请先移除原连线");
+        return;
+      }
+      let source: string | undefined = edge.source;
+      while (source) {
+        if (source === edge.target) {
+          setError("复制关系不能形成环");
+          return;
+        }
+        source = parents.get(source);
+      }
+    }
     change(
       {
         ...topology,
@@ -479,9 +559,19 @@ export default function App() {
         <select
           aria-label="切换实验"
           value={lab?.id || ""}
-          disabled={dirty || busy}
+          disabled={busy}
           onChange={(event) => {
+            if (event.target.value === "__delete_current_lab__") {
+              event.currentTarget.value = lab?.id || "";
+              setModal("delete");
+              return;
+            }
             const target = labs.find((v) => v.id === event.target.value);
+            if (target && target.id !== lab?.id && dirty) {
+              event.currentTarget.value = lab?.id || "";
+              setError("请先保存当前实验的编辑，再切换实验");
+              return;
+            }
             if (target)
               void safely(async () =>
                 selectLab(await api<Lab>("/labs/" + target.id)),
@@ -496,6 +586,14 @@ export default function App() {
               {value.name}
             </option>
           ))}
+          <optgroup label="实验操作">
+            <option
+              value="__delete_current_lab__"
+              disabled={!lab || busy || pending || !dockerReady}
+            >
+              删除当前实验…
+            </option>
+          </optgroup>
         </select>
         <button
           className="icon-button"
@@ -542,7 +640,16 @@ export default function App() {
         </div>{" "}
         <div className="lab-lifecycle">
           <button
-            disabled={!lab || !dockerReady || busy || pending}
+            disabled={
+              !lab ||
+              !dockerReady ||
+              busy ||
+              pending ||
+              stale ||
+              !lab.observation?.nodes.some((n) =>
+                ["exited", "created", "dead"].includes(n.status),
+              )
+            }
             title="只启动已有容器，不应用草稿"
             onClick={() => void safely(() => submit("start_lab"))}
           >
@@ -550,7 +657,14 @@ export default function App() {
             启动实验
           </button>
           <button
-            disabled={!lab || !dockerReady || busy || pending}
+            disabled={
+              !lab ||
+              !dockerReady ||
+              busy ||
+              pending ||
+              stale ||
+              !lab.observation?.nodes.some((n) => n.status === "running")
+            }
             title="保留容器、配置和历史结果"
             onClick={() => void safely(() => submit("stop_lab"))}
           >
@@ -613,15 +727,52 @@ export default function App() {
             </span>
             <Plus size={14} />
           </button>
-          <div className="library-note">
-            <Database size={15} />
-            <p>
-              Redis / MySQL
-              <br />
-              <span>后续组件 · 尚未开放</span>
-            </p>
-          </div>
+          <button
+            className="palette"
+            draggable={!!lab && !busy && !pending}
+            disabled={!lab || busy || pending || topology.nodes.length >= 10}
+            onDragStart={(event) =>
+              event.dataTransfer.setData("application/infra-node", "redis")
+            }
+            onClick={() => add("redis")}
+          >
+            <span className="palette-icon">
+              <Database size={21} />
+            </span>
+            <span>
+              <strong>Redis</strong>
+              <small>主从复制</small>
+            </span>
+            <Plus size={14} />
+          </button>
           <div className="section-label spaced">快速开始</div>
+          <button
+            className="template"
+            disabled={!lab || busy || pending || topology.nodes.length > 0}
+            onClick={() => {
+              const nodes = [
+                "redis-primary",
+                "redis-replica-1",
+                "redis-replica-2",
+              ].map((id, i) => ({
+                ...newNode("redis", i ? 440 : 80, i ? i * 180 - 80 : 180),
+                id,
+              }));
+              change({
+                nodes,
+                edges: nodes.slice(1).map((n) => ({
+                  source: nodes[0].id,
+                  target: n.id,
+                  weight: 1,
+                })),
+              });
+              setPanel("redis");
+            }}
+          >
+            <Database size={17} />
+            <span>Redis 一主两从</span>
+          </button>
+
           <button
             className="template"
             disabled={!lab || busy || pending || topology.nodes.length > 0}
@@ -690,7 +841,11 @@ export default function App() {
             onDrop={(event) => {
               event.preventDefault();
               const kind = event.dataTransfer.getData("application/infra-node");
-              if ((kind === "app" || kind === "nginx") && !busy && !pending)
+              if (
+                (kind === "app" || kind === "nginx" || kind === "redis") &&
+                !busy &&
+                !pending
+              )
                 add(
                   kind,
                   screenToFlowPosition({ x: event.clientX, y: event.clientY }),
@@ -742,7 +897,11 @@ export default function App() {
                   id: `${e.source}-${e.target}`,
                   source: e.source,
                   target: e.target,
-                  label: `w ${e.weight}`,
+                  label:
+                    topology.nodes.find((n) => n.id === e.source)?.kind ===
+                    "redis"
+                      ? "复制"
+                      : `w ${e.weight}`,
                   type: "smoothstep",
                   style: { stroke: "#638c7d", strokeWidth: 1.6 },
                   labelStyle: { fill: "#b7cbbf", fontSize: 11 },
@@ -924,7 +1083,14 @@ export default function App() {
               </div>
               <div>
                 {(
-                  ["client", "requests", "results", "tasks", "logs"] as const
+                  [
+                    "client",
+                    "requests",
+                    "redis",
+                    "results",
+                    "tasks",
+                    "logs",
+                  ] as const
                 ).map((key) => (
                   <button
                     className={panel === key ? "active" : ""}
@@ -941,15 +1107,17 @@ export default function App() {
                     ) : (
                       <FileCode2 size={15} />
                     )}
-                    {key === "client"
-                      ? "客户端"
-                      : key === "requests"
-                        ? "请求记录"
-                        : key === "results"
-                          ? "请求实验"
-                          : key === "tasks"
-                            ? "执行记录"
-                            : "容器日志"}
+                    {key === "redis"
+                      ? "Redis 读写"
+                      : key === "client"
+                        ? "客户端"
+                        : key === "requests"
+                          ? "请求记录"
+                          : key === "results"
+                            ? "请求实验"
+                            : key === "tasks"
+                              ? "执行记录"
+                              : "容器日志"}
                     {key === "tasks" && pending && (
                       <span className="dot green" />
                     )}
@@ -979,6 +1147,17 @@ export default function App() {
                       trace: traceEnabled,
                     }),
                   )
+                }
+              />
+            )}
+            {panel === "redis" && lab && (
+              <RedisPanel
+                key={lab.id}
+                lab={lab}
+                tasks={tasks}
+                disabled={!dockerReady || busy || pending}
+                submit={(extra) =>
+                  safely(() => submit("redis_command", lab, extra))
                 }
               />
             )}
@@ -1013,7 +1192,11 @@ export default function App() {
                           {r.path}
                         </td>
                         <td>
-                          {r.error ? "传输失败" : (r.status_code ?? statusText[r.status] ?? r.status)}
+                          {r.error
+                            ? "传输失败"
+                            : (r.status_code ??
+                              statusText[r.status] ??
+                              r.status)}
                         </td>
                         <td>
                           {r.latency_ms != null ? `${r.latency_ms} ms` : "—"}
@@ -1352,8 +1535,35 @@ export default function App() {
                 </div>
               </div>
               <div className="node-actions">
+                {node.kind === "nginx" && (
+                  <button
+                    disabled={
+                      !observation ||
+                      busy ||
+                      pending ||
+                      !dockerReady ||
+                      stale ||
+                      observation.status !== "running"
+                    }
+                    title="校验并重载当前运行配置，不应用草稿"
+                    onClick={() =>
+                      void safely(() =>
+                        submit("reload", lab, { node_id: node.id }),
+                      )
+                    }
+                  >
+                    重载
+                  </button>
+                )}
                 <button
-                  disabled={!observation || busy || pending || !dockerReady}
+                  disabled={
+                    !observation ||
+                    busy ||
+                    pending ||
+                    !dockerReady ||
+                    stale ||
+                    !["exited", "created", "dead"].includes(observation.status)
+                  }
                   onClick={() =>
                     void safely(() =>
                       submit("start", lab, { node_id: node.id }),
@@ -1364,7 +1574,14 @@ export default function App() {
                   启动
                 </button>
                 <button
-                  disabled={!observation || busy || pending || !dockerReady}
+                  disabled={
+                    !observation ||
+                    busy ||
+                    pending ||
+                    !dockerReady ||
+                    stale ||
+                    observation.status !== "running"
+                  }
                   onClick={() =>
                     void safely(() => submit("stop", lab, { node_id: node.id }))
                   }
@@ -1418,9 +1635,92 @@ export default function App() {
                   />
                 </label>
               </div>
-              {node.kind === "app" ? (
+              {node.kind === "redis" ? (
                 <>
-                  <div className="section-label spaced">响应行为</div>
+                  <label className="full-field">
+                    复制来源
+                    <select
+                      aria-label="复制来源"
+                      disabled={busy || pending}
+                      value={
+                        topology.edges.find((e) => e.target === node.id)
+                          ?.source || ""
+                      }
+                      onChange={(event) => {
+                        const edges = topology.edges.filter(
+                          (e) => e.target !== node.id,
+                        );
+                        change(
+                          {
+                            ...topology,
+                            edges: event.target.value
+                              ? [
+                                  ...edges,
+                                  {
+                                    source: event.target.value,
+                                    target: node.id,
+                                    weight: 1,
+                                  },
+                                ]
+                              : edges,
+                          },
+                          true,
+                        );
+                      }}
+                    >
+                      <option value="">无（主节点）</option>
+                      {topology.nodes
+                        .filter((n) => n.kind === "redis" && n.id !== node.id)
+                        .map((n) => (
+                          <option key={n.id}>{n.id}</option>
+                        ))}
+                    </select>
+                  </label>
+                  <p className="hint">
+                    复制关系应用后生效。主节点停机不会自动切主。改变来源会同步并替换从节点数据。
+                  </p>
+                  <p className="hint">
+                    AOF
+                    每秒持久化；停止保留数据，删除或修改资源后重建会清空数据。
+                  </p>
+                  <button
+                    onClick={() => {
+                      setPanel("redis");
+                      setDockMode("normal");
+                    }}
+                  >
+                    打开 Redis 读写
+                  </button>
+                  <pre className="redis-info">
+                    {JSON.stringify(
+                      !stale
+                        ? (observation?.redis ?? { available: false })
+                        : { available: false, error: "观测过期" },
+                      null,
+                      2,
+                    )}
+                  </pre>
+                </>
+              ) : node.kind === "app" ? (
+                <>
+                  {lab && lab.draft.nodes.some((n) => n.id === node.id) && (
+                    <ResponseSettings
+                      key={`${lab.id}:${node.id}`}
+                      labId={lab.id}
+                      nodeId={node.id}
+                      observation={observation}
+                      stale={stale}
+                      disabled={busy || pending || !dockerReady}
+                      tasks={tasks}
+                      apply={(version) =>
+                        submit("apply_response", lab, {
+                          node_id: node.id,
+                          response_version: version,
+                        })
+                      }
+                    />
+                  )}
+                  <div className="section-label spaced">默认网站故障参数</div>
                   <label className="full-field">
                     响应延迟 / ms
                     <input
@@ -1604,7 +1904,7 @@ export default function App() {
             >
               <X size={18} />
             </button>
-            <h2>{modal === "new" ? "创建独立实验" : "清理运行资源"}</h2>
+            <h2>{modal === "new" ? "创建独立实验" : modal === "delete" ? "删除实验" : "清理运行资源"}</h2>
             {modal === "new" ? (
               <>
                 <p>草稿与实验结果独立保存，部署时创建专用网络。</p>
@@ -1628,19 +1928,19 @@ export default function App() {
             ) : (
               <>
                 <p>
-                  将停止并删除此实验的容器和网络。草稿、配置版本和历史结果保留，可以再次应用。
+                  {modal === "delete" ? `永久删除“${lab?.name}”：容器、网络、网站入口、草稿、配置版本和全部历史记录都会移除，无法撤销。` : "将停止并删除此实验的容器和网络。草稿、配置版本和历史结果保留，可以再次应用。"}
                 </p>
                 <button
                   className="danger"
-                  disabled={busy}
+                  disabled={busy || pending}
                   onClick={() =>
                     void safely(async () => {
-                      await submit("cleanup");
+                      await submit(modal === "delete" ? "delete_lab" : "cleanup");
                       setModal(null);
                     })
                   }
                 >
-                  确认清理此实验
+                  {modal === "delete" ? "确认永久删除" : "确认清理此实验"}
                 </button>
               </>
             )}

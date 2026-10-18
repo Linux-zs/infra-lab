@@ -1347,10 +1347,9 @@ body,
   min-height: 0;
   overflow: hidden;
   display: grid;
-  grid-template-rows: 40px minmax(
-      0,
-      calc(100% - 46px - var(--dock-size))
-    ) 6px minmax(0, var(--dock-size));
+  grid-template-rows:
+    40px minmax(0, calc(100% - 46px - var(--dock-size)))
+    6px minmax(0, var(--dock-size));
 }
 .canvas-toolbar {
   height: 40px;
@@ -1520,4 +1519,76 @@ body,
     z-index: 12;
     box-shadow: -10px 0 30px #0005;
   }
+}
+
+.redis-panel {
+  min-height: 0;
+  overflow: auto;
+  padding: 16px;
+}
+.redis-command {
+  display: flex;
+  align-items: center;
+  gap: 8px;
+  flex-wrap: wrap;
+  margin-bottom: 16px;
+}
+.redis-command input {
+  width: 150px;
+}
+.redis-command label {
+  display: flex;
+  align-items: center;
+  gap: 8px;
+}
+.redis-command label input {
+  width: 85px;
+}
+.redis-info,
+.redis-history pre {
+  white-space: pre-wrap;
+  overflow-wrap: anywhere;
+  font-size: 12px;
+}
+.redis-history > div {
+  border-bottom: 1px solid var(--border);
+  padding: 12px 0;
+}
+.service-node.redis .node-icon {
+  color: #e4ac78;
+}
+
+.response-settings textarea {
+  width: 100%;
+  resize: vertical;
+  min-height: 120px;
+  max-height: 360px;
+  background: var(--panel);
+  color: inherit;
+  border: 1px solid #34453b;
+  padding: 8px;
+  box-sizing: border-box;
+  font: 12px monospace;
+}
+.response-header {
+  display: grid;
+  grid-template-columns: minmax(0, 1fr) minmax(0, 1fr) 28px;
+  gap: 5px;
+  margin: 6px 0;
+}
+.response-header input {
+  min-width: 0;
+  width: 100%;
+}
+.response-actions {
+  display: flex;
+  flex-wrap: wrap;
+  gap: 6px;
+}
+
+.response-settings fieldset {
+  border: 0;
+  padding: 0;
+  margin: 0;
+  min-width: 0;
 }
