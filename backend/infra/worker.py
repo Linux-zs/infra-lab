@@ -1,6 +1,8 @@
 import json
 import os
+import threading
 import time
+from concurrent.futures import ThreadPoolExecutor
 from pathlib import Path
 
 from . import db
@@ -11,7 +13,11 @@ def claim():
     with db.connect() as con:
         con.execute("BEGIN IMMEDIATE")
         task = db.unpack(
-            con.execute("SELECT * FROM tasks WHERE status='queued' ORDER BY created_at LIMIT 1").fetchone()
+            con.execute(
+                "SELECT q.* FROM tasks q WHERE q.status='queued' AND NOT EXISTS ("
+                "SELECT 1 FROM tasks running WHERE running.lab_id=q.lab_id AND running.status='running') "
+                "ORDER BY q.created_at LIMIT 1"
+            ).fetchone()
         )
         if task:
             con.execute("UPDATE tasks SET status='running',updated_at=? WHERE id=?", (db.now(), task["id"]))
@@ -51,11 +57,7 @@ def execute(task, runtime):
     if task["kind"] == "delete_lab":
         with db.connect() as con:
             con.execute("UPDATE entries SET active=0,trace=0 WHERE lab_id=?", (lab_id,))
-        containers = runtime.containers(lab_id)
         runtime.cleanup(lab_id, emit)
-        with db.connect() as con:
-            for container in containers:
-                con.execute("DELETE FROM meta WHERE key=?", (f"node-ip:{container.id}",))
         db.erase_lab(lab_id)
         return {"deleted": True}
     if task["kind"] == "cleanup":
@@ -121,6 +123,32 @@ def heartbeat(available, error=None):
         )
 
 
+def run_task(task):
+    runtime = None
+    stop = threading.Event()
+
+    def pulse():
+        while not stop.wait(5):
+            heartbeat(True)
+
+    thread = threading.Thread(target=pulse, daemon=True)
+    thread.start()
+    try:
+        runtime = Runtime()
+        result = execute(task, runtime)
+        db.finish(task["id"], "failed" if result.get("partial_failure") else "succeeded", result)
+    except Exception as exc:
+        db.log(task["id"], f"失败：{exc}。可能存在已完成步骤；保留现场。")
+        db.finish(task["id"], "failed", {"error": str(exc)})
+        db.request_event(task["id"], "worker", "worker.failed", data={"error": str(exc)})
+        db.request_status(task["id"], "failed", {"error": str(exc)})
+    finally:
+        stop.set()
+        thread.join()
+        if runtime:
+            runtime.close()
+
+
 def main():
     db.init()
     # Singleton worker: kernel lock releases automatically on crash; DB serializes tasks.
@@ -129,56 +157,49 @@ def main():
     lock = (Path(os.getenv("INFRA_DATA", "data")) / "worker.lock").open("w")
     fcntl.flock(lock, fcntl.LOCK_EX | fcntl.LOCK_NB)
     recover()
-    while True:
-        runtime = None
-        try:
-            runtime = Runtime()
-            heartbeat(True)
-            task = claim()
-            if task:
-                # Separate heartbeat thread keeps long operations distinguishable from a dead worker.
-                import threading
-
-                stop = threading.Event()
-
-                def pulse(signal=stop):
-                    while not signal.wait(5):
-                        heartbeat(True)
-
-                thread = threading.Thread(target=pulse, daemon=True)
-                thread.start()
-                try:
-                    result = execute(task, runtime)
-                    db.finish(task["id"], "failed" if result.get("partial_failure") else "succeeded", result)
-                except Exception as exc:
-                    db.log(task["id"], f"失败：{exc}。可能存在已完成步骤；保留现场。")
-                    db.finish(task["id"], "failed", {"error": str(exc)})
-                    db.request_event(task["id"], "worker", "worker.failed", data={"error": str(exc)})
-                    db.request_status(task["id"], "failed", {"error": str(exc)})
-                finally:
-                    stop.set()
-                    thread.join()
-            with db.connect() as con:
-                labs = [row[0] for row in con.execute("SELECT id FROM labs")]
-            for lab_id in labs:
-                try:
-                    observation = runtime.observe(lab_id)
-                except Exception as exc:
-                    observation = {"available": False, "error": str(exc)}
+    with ThreadPoolExecutor(max_workers=2, thread_name_prefix="infra-task") as executor:
+        observer = None
+        history_migrated = False
+        active = {}
+        while True:
+            try:
+                if observer is None:
+                    observer = Runtime()
+                if not history_migrated:
+                    observer.migrate_node_ip_history()
+                    history_migrated = True
+                for task_id, (_, future) in list(active.items()):
+                    if future.done():
+                        active.pop(task_id, None)
+                while len(active) < 2:
+                    task = claim()
+                    if not task:
+                        break
+                    future = executor.submit(run_task, task)
+                    active[task["id"]] = (task["lab_id"], future)
+                busy_labs = {lab_id for lab_id, _ in active.values()}
                 with db.connect() as con:
-                    if observation["available"]:
-                        con.execute(
-                            "UPDATE labs SET observation=?,observed_at=? WHERE id=?",
-                            (json.dumps(observation), db.now(), lab_id),
-                        )
-                    # Keep last good snapshot; its timestamp makes staleness visible.
-            heartbeat(True)
-        except Exception as exc:
-            heartbeat(False, str(exc))
-        finally:
-            if runtime:
-                runtime.close()
-        time.sleep(2)
+                    labs = [row[0] for row in con.execute("SELECT id FROM labs")]
+                for lab_id in labs:
+                    if lab_id in busy_labs:
+                        continue
+                    try:
+                        observation = observer.observe(lab_id)
+                    except Exception as exc:
+                        observation = {"available": False, "error": str(exc)}
+                    with db.connect() as con:
+                        if observation["available"]:
+                            con.execute(
+                                "UPDATE labs SET observation=?,observed_at=? WHERE id=?",
+                                (json.dumps(observation), db.now(), lab_id),
+                            )
+                heartbeat(True)
+            except Exception as exc:
+                heartbeat(False, str(exc))
+                if observer:
+                    observer.close()
+                    observer = None
+            time.sleep(1)
 
 
 if __name__ == "__main__":

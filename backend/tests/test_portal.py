@@ -1,3 +1,5 @@
+import json
+import sqlite3
 from unittest.mock import Mock
 
 import httpx
@@ -101,3 +103,51 @@ def test_body_limit_and_stopped_node(clients, monkeypatch):
     resolve.assert_not_called()
     assert browser.get("/", headers=headers).status_code == 503
     assert len(control.get(f"/api/labs/{lab}/requests").json()) == 2
+
+
+def test_database_reservation_failure_releases_concurrency_slot(clients, monkeypatch):
+    _, browser, _, entry = clients
+    initial = portal.slots._value
+
+    def fail(*_):
+        raise sqlite3.OperationalError("database is locked")
+
+    monkeypatch.setattr(portal, "reserve_request", fail)
+    response = browser.get("/", headers={"host": entry["hostname"] + ":8089"})
+    assert response.status_code == 503
+    assert portal.slots._value == initial
+
+
+def test_backend_alias_redirect_is_rewritten_to_entry_host():
+    headers = httpx.Headers({"location": "http://il-lab-app-a:8080/page?x=1"})
+    rewritten = portal.response_headers(headers, "site.localhost:8089", {"il-lab-app-a"})
+    assert dict((key.decode().lower(), value.decode()) for key, value in rewritten)["location"] == (
+        "http://site.localhost:8089/page?x=1"
+    )
+
+
+def test_traces_share_incremental_log_poll_and_deduplicate(tmp_path, monkeypatch):
+    monkeypatch.setenv("INFRA_DATA", str(tmp_path))
+    db.init()
+    container = Mock(id="nginx-id", labels={"infra.kind": "nginx", "infra.node": "gateway"})
+    lines = [
+        json.dumps({"request_id": request_id, "upstream": "172.30.0.4:8080", "upstream_status": "200", "status": 200})
+        for request_id in ("request-one", "request-two")
+    ]
+    container.logs.return_value = ("\n".join(lines) + "\n").encode()
+    resources = (Mock(), container, [container], "172.30.0.2", {"172.30.0.4": "app-a"}, {})
+    traces = [portal.Trace(request_id, resources) for request_id in ("request-one", "request-two")]
+    with db.connect() as con:
+        for trace in traces:
+            con.execute(
+                "INSERT INTO client_requests VALUES(?,?,?,?,?,?,NULL,?,?)",
+                (trace.id, "lab-a", "gateway", "/", 1, "running", db.now(), db.now()),
+            )
+    collector = portal.LabTraceCollector("lab-a")
+    collector.traces = {trace.id: trace for trace in traces}
+    collector.poll()
+    collector.poll()
+    assert container.logs.call_count == 2
+    assert all(call.kwargs["tail"] == 2000 and "since" in call.kwargs for call in container.logs.call_args_list)
+    with db.connect() as con:
+        assert con.execute("SELECT COUNT(*) FROM request_events").fetchone()[0] == 2

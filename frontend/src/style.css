@@ -450,7 +450,7 @@ h1 {
   margin-left: 7px;
 }
 .service-node {
-  width: 210px;
+  width: 250px;
   background: #1a2720;
   border: 1px solid #3b5343;
   border-radius: 9px;
@@ -468,7 +468,7 @@ h1 {
   display: flex;
   align-items: center;
   gap: 8px;
-  padding: 13px 14px 8px;
+  padding: 14px 16px 9px;
 }
 .node-icon {
   color: var(--mint);
@@ -478,30 +478,30 @@ h1 {
 }
 .node-type {
   font-family: "IBM Plex Mono", monospace;
-  font-size: 8px;
+  font-size: 11px;
   letter-spacing: 0.4px;
   color: #a3b6a6;
 }
 .service-node > strong {
   display: block;
-  padding: 0 14px;
+  padding: 0 16px;
   font-family: "IBM Plex Mono", monospace;
-  font-size: 15px;
+  font-size: 18px;
   font-weight: 500;
 }
 .node-sub {
-  padding: 7px 14px 13px;
+  padding: 8px 16px 14px;
   color: #829a88;
-  font-size: 10px;
+  font-size: 12px;
 }
 .node-bottom {
   display: flex;
   align-items: center;
   gap: 6px;
-  padding: 9px 14px;
+  padding: 9px 16px;
   border-top: 1px solid #324537;
   color: #a3b7a7;
-  font-size: 9px;
+  font-size: 10px;
 }
 .node-bottom > span:last-child {
   margin-left: auto;
@@ -871,6 +871,12 @@ details pre {
   border-radius: 6px;
   overflow: hidden;
 }
+.editor-loading {
+  width: 100%;
+  height: 100%;
+  min-height: 160px;
+  background: #111a15;
+}
 .inspector-empty {
   margin-top: 140px;
   text-align: center;
@@ -1207,6 +1213,10 @@ details pre {
   border-color: #e6bf71;
   box-shadow: 0 0 0 2px #e6bf7133;
 }
+.virtual-client.trace-highlight {
+  border-color: #e6bf71;
+  box-shadow: 0 0 0 2px #e6bf7133;
+}
 .node-trace-label {
   position: absolute;
   bottom: calc(100% + 7px);
@@ -1219,7 +1229,7 @@ details pre {
   border-radius: 4px;
 }
 .virtual-client {
-  width: 220px;
+  width: 250px;
   padding: 18px;
   background: #28291f;
   border: 1px solid #a18b58;
@@ -1230,7 +1240,7 @@ details pre {
 }
 .virtual-client span {
   color: #c5ac71;
-  font: 10px monospace;
+  font: 11px monospace;
 }
 .virtual-client strong {
   font-size: 17px;
@@ -1347,9 +1357,7 @@ body,
   min-height: 0;
   overflow: hidden;
   display: grid;
-  grid-template-rows:
-    40px minmax(0, calc(100% - 46px - var(--dock-size)))
-    6px minmax(0, var(--dock-size));
+  grid-template-rows: 40px minmax(0, 1fr) 6px minmax(0, var(--dock-size));
 }
 .canvas-toolbar {
   height: 40px;
@@ -1452,7 +1460,8 @@ body,
   overflow: visible;
 }
 .client-panel {
-  padding: 12px 16px;
+  padding: 10px 14px;
+  overflow: visible;
 }
 .client-panel .client-body,
 .response-details pre {

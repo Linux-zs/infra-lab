@@ -21,7 +21,6 @@ def connect():
     root.mkdir(parents=True, exist_ok=True)
     con = sqlite3.connect(root / "infra.db", timeout=10)
     con.row_factory = sqlite3.Row
-    con.execute("PRAGMA journal_mode=WAL")
     try:
         yield con
         con.commit()
@@ -34,6 +33,7 @@ def connect():
 
 def init():
     with connect() as con:
+        con.execute("PRAGMA journal_mode=WAL")
         con.executescript("""
         CREATE TABLE IF NOT EXISTS response_versions (
           lab_id TEXT NOT NULL,node_id TEXT NOT NULL,version INTEGER NOT NULL,
@@ -58,6 +58,14 @@ def init():
           logs TEXT NOT NULL DEFAULT '[]', result TEXT, created_at REAL NOT NULL,
           updated_at REAL NOT NULL, UNIQUE(lab_id,request_id)
         );
+        CREATE TABLE IF NOT EXISTS task_receipts (
+          lab_id TEXT NOT NULL, request_id TEXT NOT NULL, task_id TEXT NOT NULL,
+          action TEXT NOT NULL, created_at REAL NOT NULL,
+          PRIMARY KEY(lab_id,request_id)
+        );
+        CREATE INDEX IF NOT EXISTS tasks_queue ON tasks(status,created_at);
+        CREATE INDEX IF NOT EXISTS tasks_lab_created ON tasks(lab_id,created_at DESC);
+        CREATE INDEX IF NOT EXISTS tasks_lab_status ON tasks(lab_id,status);
         CREATE TABLE IF NOT EXISTS meta (key TEXT PRIMARY KEY, value TEXT NOT NULL);
         CREATE TABLE IF NOT EXISTS client_requests (
           id TEXT PRIMARY KEY, lab_id TEXT NOT NULL, node_id TEXT NOT NULL,
@@ -82,6 +90,13 @@ def init():
           request_id TEXT PRIMARY KEY, entry_id TEXT NOT NULL, method TEXT NOT NULL
         );
         """)
+        # Preserve request deduplication after bulky task details are pruned.
+        for row in con.execute("SELECT lab_id,request_id,id,payload,created_at FROM tasks"):
+            action = json.loads(row["payload"]).get("action", {})
+            con.execute(
+                "INSERT OR IGNORE INTO task_receipts VALUES(?,?,?,?,?)",
+                (row["lab_id"], row["request_id"], row["id"], json.dumps(action), row["created_at"]),
+            )
 
 
 def unpack(row):
@@ -110,6 +125,21 @@ def finish(task_id, status, result=None):
             "UPDATE tasks SET status=?,result=?,updated_at=? WHERE id=?",
             (status, json.dumps(result), now(), task_id),
         )
+        row = con.execute("SELECT lab_id FROM tasks WHERE id=?", (task_id,)).fetchone()
+        if row and status not in ("queued", "running"):
+            prune_tasks(con, row[0])
+
+
+TASK_HISTORY_PER_LAB = 500
+
+
+def prune_tasks(con, lab_id):
+    con.execute(
+        "DELETE FROM tasks WHERE lab_id=? AND status NOT IN ('queued','running') AND id NOT IN ("
+        "SELECT id FROM tasks WHERE lab_id=? AND status NOT IN ('queued','running') "
+        "ORDER BY created_at DESC LIMIT ?)",
+        (lab_id, lab_id, TASK_HISTORY_PER_LAB),
+    )
 
 
 def request_event(request_id, source, kind, node_id=None, evidence="live", timestamp=None, data=None):
@@ -167,6 +197,7 @@ def erase_lab(lab_id):
     with connect() as con:
         con.execute("BEGIN IMMEDIATE")
         con.execute("DELETE FROM browser_requests WHERE request_id IN (SELECT id FROM client_requests WHERE lab_id=?)", (lab_id,))
-        for table in ("request_events", "client_requests", "entries", "response_versions", "response_state", "revisions", "tasks"):
+        for table in ("request_events", "client_requests", "entries", "response_versions", "response_state", "revisions", "tasks", "task_receipts"):
             con.execute(f"DELETE FROM {table} WHERE lab_id=?", (lab_id,))
         con.execute("DELETE FROM labs WHERE id=?", (lab_id,))
+        con.execute("DELETE FROM meta WHERE key LIKE ?", (f"node-ip-v2:{lab_id}:%",))

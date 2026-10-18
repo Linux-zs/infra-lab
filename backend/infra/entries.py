@@ -58,6 +58,9 @@ def create_entry(lab_id: str, body: EntryInput):
 @router.patch("/{entry_id}")
 def set_trace(lab_id: str, entry_id: str, body: TraceInput):
     with db.connect() as con:
+        con.execute("BEGIN IMMEDIATE")
+        if db.deleting(con, lab_id):
+            raise HTTPException(409, "实验正在删除")
         result = con.execute(
             "UPDATE entries SET trace=? WHERE id=? AND lab_id=? AND active=1",
             (int(body.trace), entry_id, lab_id),

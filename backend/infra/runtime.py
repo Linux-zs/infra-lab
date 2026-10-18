@@ -5,6 +5,7 @@ import io
 import json
 import os
 import tarfile
+import threading
 import time
 
 import docker
@@ -13,6 +14,8 @@ from docker.errors import NotFound
 from .redis_runtime import cli, command, redis_config, replication
 
 OWNER = "infra-lab-v1"
+NODE_IP_PREFIX = "node-ip-v2"
+RESOURCE_LOCK = threading.RLock()
 
 
 def labels(lab_id, **extra):
@@ -21,6 +24,59 @@ def labels(lab_id, **extra):
 
 def filters(lab_id):
     return {"label": [f"infra.owner={OWNER}", f"infra.lab={lab_id}"]}
+
+
+def node_ip_key(lab_id, container_id):
+    return f"{NODE_IP_PREFIX}:{lab_id}:{container_id}"
+
+
+def container_memory(container):
+    return int(container.attrs.get("HostConfig", {}).get("Memory", 0))
+
+
+def projected_peak_memory(lab_containers, nodes, image_for):
+    """Conservative same-lab peak while replacing nodes and validating Nginx."""
+    resident = sum(container_memory(c) for c in lab_containers)
+    peak = resident
+    existing = {
+        c.labels.get("infra.node"): c
+        for c in lab_containers
+        if c.labels.get("infra.role") == "node"
+    }
+    by_id = {node["id"]: node for node in nodes}
+
+    def rank(node):
+        if node["kind"] == "nginx":
+            return 100
+        depth, parent = 0, node.get("replica_of")
+        while parent:
+            depth += 1
+            parent = by_id[parent].get("replica_of")
+        return depth
+
+    for node in sorted(nodes, key=rank):
+        memory = int(node["memory_mb"]) * 1048576
+        current = existing.get(node["id"])
+        if node["kind"] == "nginx":
+            peak = max(peak, resident + memory)
+        replace = bool(
+            current
+            and (
+                current.labels.get("infra.spec") != fingerprint(node)
+                or current.attrs.get("Config", {}).get("Image") != image_for(node["kind"])
+                or (
+                    node["kind"] == "app"
+                    and current.labels.get("infra.capabilities") != "client-page-trace-v3"
+                )
+            )
+        )
+        if replace:
+            resident -= container_memory(current)
+            current = None
+        if current is None:
+            resident += memory
+        peak = max(peak, resident)
+    return peak
 
 
 def fingerprint(node):
@@ -148,7 +204,8 @@ class Runtime:
             )
             if command:
                 options["command"] = command
-        container = self.client.containers.create(**options)
+        with RESOURCE_LOCK:
+            container = self.client.containers.create(**options)
         if role == "node":
             # Docker's default alias is the long container name; add stable per-lab DNS.
             network.disconnect(container)
@@ -215,15 +272,17 @@ class Runtime:
             raise
 
     def apply(self, lab_id, topology, task_id, emit):
+        with RESOURCE_LOCK:
+            return self._apply_locked(lab_id, topology, task_id, emit)
+
+    def _apply_locked(self, lab_id, topology, task_id, emit):
         nodes = topology["nodes"]
-        allocated = sum(
-            c.attrs["HostConfig"].get("Memory", 0)
-            for c in self.client.containers.list(all=True, filters={"label": f"infra.owner={OWNER}"})
-            if c.labels.get("infra.lab") != lab_id
-        )
-        desired = sum(n["memory_mb"] for n in nodes) * 1048576
+        owned = self.client.containers.list(all=True, filters={"label": f"infra.owner={OWNER}"})
+        allocated = sum(container_memory(c) for c in owned if c.labels.get("infra.lab") != lab_id)
+        lab_containers = [c for c in owned if c.labels.get("infra.lab") == lab_id]
         limit = int(os.getenv("INFRA_TOTAL_MEMORY_MB", "768")) * 1048576
-        if allocated + desired > limit:
+        peak = projected_peak_memory(lab_containers, nodes, self.image_for)
+        if allocated + peak > limit:
             raise RuntimeError("超出平台实验内存配额（默认合计 768 MB），请先清理不用的实验")
         existing = {
             c.labels["infra.node"]: c for c in self.containers(lab_id) if c.labels.get("infra.role") == "node"
@@ -254,6 +313,7 @@ class Runtime:
             ):
                 emit(f"{node['id']} 参数改变，重建此实例")
                 current.remove(force=True)
+                self.forget_container_history(lab_id, current)
                 current = None
             if current is None:
                 emit(f"创建 {node['id']}")
@@ -291,28 +351,61 @@ class Runtime:
             if node_id not in keep:
                 emit(f"移除已从拓扑删除的节点 {node_id}")
                 container.remove(force=True)
+                self.forget_container_history(lab_id, container)
+
+    @staticmethod
+    def forget_container_history(lab_id, container):
+        from . import db
+
+        with db.connect() as con:
+            con.execute(
+                "DELETE FROM meta WHERE key IN (?,?)",
+                (node_ip_key(lab_id, container.id), f"node-ip:{container.id}"),
+            )
 
     def observe(self, lab_id):
         from . import db
 
         result = []
-        for c in self.containers(lab_id):
-            if c.labels.get("infra.role") != "node":
-                continue
-            c.reload()
-            state = c.attrs["State"]
-            ip = c.attrs["NetworkSettings"]["Networks"].get(f"il-{lab_id}", {}).get("IPAddress")
-            # Docker clears endpoint IPs on stop. Preserve evidence tied to the exact
-            # container ID, never to a reusable node name, for failed upstream mapping.
+        nodes = [c for c in self.containers(lab_id) if c.labels.get("infra.role") == "node"]
+        keys = [node_ip_key(lab_id, c.id) for c in nodes]
+        legacy_keys = [f"node-ip:{c.id}" for c in nodes]
+        current = {}
+        for container in nodes:
+            container.reload()
+            current[container.id] = (
+                container.attrs["State"],
+                container.attrs["NetworkSettings"]["Networks"].get(f"il-{lab_id}", {}).get("IPAddress"),
+            )
+        history = {}
+        if keys:
             with db.connect() as con:
-                key = f"node-ip:{c.id}"
-                if ip:
-                    con.execute(
-                        "INSERT OR REPLACE INTO meta VALUES(?,?)",
-                        (key, json.dumps({"ip": ip, "time": time.time()})),
+                history = {
+                    row[0]: json.loads(row[1])
+                    for row in con.execute(
+                        "SELECT key,value FROM meta WHERE key IN (" + ",".join("?" for _ in keys + legacy_keys) + ")",
+                        keys + legacy_keys,
                     )
-                previous = con.execute("SELECT value FROM meta WHERE key=?", (key,)).fetchone()
-                last_ip = json.loads(previous[0]) if previous else None
+                }
+                for container in nodes:
+                    key = node_ip_key(lab_id, container.id)
+                    legacy_key = f"node-ip:{container.id}"
+                    ip = current[container.id][1]
+                    if ip:
+                        history[key] = {"ip": ip, "time": time.time()}
+                        con.execute(
+                            "INSERT OR REPLACE INTO meta VALUES(?,?)",
+                            (key, json.dumps(history[key])),
+                        )
+                    elif key not in history and legacy_key in history:
+                        history[key] = history[legacy_key]
+                        con.execute("INSERT OR IGNORE INTO meta VALUES(?,?)", (key, json.dumps(history[key])))
+                    if legacy_key in history:
+                        con.execute("DELETE FROM meta WHERE key=?", (legacy_key,))
+        for c in nodes:
+            state, ip = current[c.id]
+            key = node_ip_key(lab_id, c.id)
+            last_ip = history.get(key)
             response_state = None
             if c.labels.get("infra.capabilities") == "client-page-trace-v3" and c.status == "running":
                 from .response_runtime import reconcile
@@ -341,6 +434,26 @@ class Runtime:
             )
         return {"available": True, "nodes": result}
 
+    def migrate_node_ip_history(self):
+        from . import db
+
+        containers = self.client.containers.list(all=True, filters={"label": f"infra.owner={OWNER}"})
+        owned = {
+            c.id: (c.labels.get("infra.lab"), c.labels.get("infra.role"))
+            for c in containers
+            if c.labels.get("infra.lab")
+        }
+        with db.connect() as con:
+            for row in con.execute("SELECT key,value FROM meta WHERE key LIKE 'node-ip:%'").fetchall():
+                container_id = row["key"][len("node-ip:"):]
+                lab_id, role = owned.get(container_id, (None, None))
+                if lab_id and role == "node":
+                    con.execute(
+                        "INSERT OR IGNORE INTO meta VALUES(?,?)",
+                        (node_ip_key(lab_id, container_id), row["value"]),
+                    )
+                con.execute("DELETE FROM meta WHERE key=?", (row["key"],))
+
     def logs(self, lab_id, node_id):
         return self.node(lab_id, node_id).logs(tail=150).decode(errors="replace")
 
@@ -348,6 +461,7 @@ class Runtime:
         for container in self.containers(lab_id):
             emit(f"删除本实验容器 {container.name}")
             container.remove(force=True)
+            self.forget_container_history(lab_id, container)
         for network in self.client.networks.list(filters=filters(lab_id)):
             network.remove()
 

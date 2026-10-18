@@ -95,3 +95,49 @@ def test_interrupted_task_does_not_claim_success(client):
     assert client.get(f"/api/labs/{lab['id']}").json()["applied_revision"] is None
     with db.connect() as con:
         assert con.execute("SELECT status FROM tasks").fetchone()[0] == "interrupted"
+
+
+def test_archived_task_keeps_idempotency_receipt(client, monkeypatch):
+    monkeypatch.setattr(db, "TASK_HISTORY_PER_LAB", 1)
+    lab = client.post("/api/labs", json={"name": "retention"}).json()
+    root = f"/api/labs/{lab['id']}"
+    first = {"kind": "cleanup", "revision": 0, "request_id": "archive-first"}
+    second = {"kind": "cleanup", "revision": 0, "request_id": "archive-second"}
+    client.post(root + "/tasks", json=first)
+    with db.connect() as con:
+        first_id = con.execute("SELECT id FROM tasks WHERE request_id=?", (first["request_id"],)).fetchone()[0]
+    db.finish(first_id, "succeeded", {"cleaned": True})
+    client.post(root + "/tasks", json=second)
+    with db.connect() as con:
+        second_id = con.execute("SELECT id FROM tasks WHERE request_id=?", (second["request_id"],)).fetchone()[0]
+    db.finish(second_id, "succeeded", {"cleaned": True})
+    assert len(client.get(root + "/tasks").json()) == 1
+    assert client.post(root + "/tasks", json=first).status_code == 410
+    assert client.post(root + "/tasks", json={**first, "kind": "start_lab"}).status_code == 409
+
+
+def test_worker_claims_other_labs_but_serializes_each_lab(client):
+    first_lab = client.post("/api/labs", json={"name": "first"}).json()
+    second_lab = client.post("/api/labs", json={"name": "second"}).json()
+    for lab, request_id in ((first_lab, "first-task-1"), (first_lab, "first-task-2"), (second_lab, "second-task")):
+        client.post(
+            f"/api/labs/{lab['id']}/tasks",
+            json={"kind": "cleanup", "revision": 0, "request_id": request_id},
+        )
+    one = claim()
+    two = claim()
+    assert one["lab_id"] != two["lab_id"]
+    assert claim() is None
+
+
+def test_delete_task_blocks_draft_writes(client):
+    lab = client.post("/api/labs", json={"name": "delete guard"}).json()
+    root = f"/api/labs/{lab['id']}"
+    with db.connect() as con:
+        con.execute(
+            "INSERT INTO tasks(id,lab_id,request_id,kind,status,payload,created_at,updated_at) "
+            "VALUES(?,?,?,?,?,?,?,?)",
+            ("delete-task", lab["id"], "delete-request", "delete_lab", "queued", '{}', db.now(), db.now()),
+        )
+    assert client.put(root + "/draft", json={"base_revision": 0, "topology": graph()}).status_code == 409
+    assert client.patch(root + "/entries/fake", json={"trace": True}).status_code == 409

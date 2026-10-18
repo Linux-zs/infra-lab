@@ -1,4 +1,5 @@
 import { useEffect, useRef } from "react";
+import "./monacoSetup";
 import { editor } from "monaco-editor/esm/vs/editor/editor.api";
 
 export default function ConfigDiff({

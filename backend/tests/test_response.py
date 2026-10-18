@@ -48,6 +48,25 @@ def test_saved_response_conflict_and_frozen_task(tmp_path, monkeypatch):
         assert client.get(path).json()["version"] == 2
 
 
+def test_deleting_lab_rejects_response_edits(tmp_path, monkeypatch):
+    monkeypatch.setenv("INFRA_DATA", str(tmp_path))
+    with TestClient(app) as client:
+        lab = client.post("/api/labs", json={"name": "response delete guard"}).json()
+        root = f"/api/labs/{lab['id']}"
+        topology = {"nodes": [{"id": "app-a", "kind": "app", "position": {"x": 0, "y": 0}}], "edges": []}
+        client.put(root + "/draft", json={"base_revision": 0, "topology": topology})
+        with db.connect() as con:
+            con.execute(
+                "INSERT INTO tasks(id,lab_id,request_id,kind,status,payload,created_at,updated_at) "
+                "VALUES(?,?,?,?,?,?,?,?)",
+                ("delete-task", lab["id"], "delete-request", "delete_lab", "queued", '{}', db.now(), db.now()),
+            )
+        response = client.put(
+            root + "/nodes/app-a/response", json={"base_version": 0, "config": DEFAULT}
+        )
+        assert response.status_code == 409
+
+
 def test_real_application_snapshot_methods_and_health(monkeypatch):
     # Execute the same server module shipped in the application image.
     monkeypatch.setitem(sys.modules, "response_config", response_config)

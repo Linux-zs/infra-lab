@@ -11,7 +11,11 @@ services:
       - state:/data
       - /var/run/docker.sock:/var/run/docker.sock
     environment:
-      INFRA_ALLOWED_HOSTS: localhost,127.0.0.1,testserver
+      INFRA_DATA: /data
+      INFRA_ALLOWED_HOSTS: ${INFRA_ALLOWED_HOSTS:-localhost,127.0.0.1,testserver}
+      INFRA_NGINX_IMAGE: ${INFRA_NGINX_IMAGE:-nginx:1.28.0-alpine}
+      INFRA_APP_IMAGE: ${INFRA_APP_IMAGE:-infra-lab-app:1.3.0}
+      INFRA_REDIS_IMAGE: ${INFRA_REDIS_IMAGE:-redis:7.4.7-alpine}
     mem_limit: 160m
     cpus: 0.5
     restart: unless-stopped
@@ -24,6 +28,12 @@ services:
     volumes:
       - state:/data
       - /var/run/docker.sock:/var/run/docker.sock
+    environment:
+      INFRA_DATA: /data
+      INFRA_TOTAL_MEMORY_MB: ${INFRA_TOTAL_MEMORY_MB:-768}
+      INFRA_NGINX_IMAGE: ${INFRA_NGINX_IMAGE:-nginx:1.28.0-alpine}
+      INFRA_APP_IMAGE: ${INFRA_APP_IMAGE:-infra-lab-app:1.3.0}
+      INFRA_REDIS_IMAGE: ${INFRA_REDIS_IMAGE:-redis:7.4.7-alpine}
     mem_limit: 160m
     cpus: 0.5
     restart: unless-stopped
@@ -37,6 +47,11 @@ services:
     volumes:
       - state:/data
       - /var/run/docker.sock:/var/run/docker.sock
+    environment:
+      INFRA_DATA: /data
+      INFRA_NGINX_IMAGE: ${INFRA_NGINX_IMAGE:-nginx:1.28.0-alpine}
+      INFRA_APP_IMAGE: ${INFRA_APP_IMAGE:-infra-lab-app:1.3.0}
+      INFRA_REDIS_IMAGE: ${INFRA_REDIS_IMAGE:-redis:7.4.7-alpine}
     mem_limit: 192m
     cpus: 0.5
     restart: unless-stopped

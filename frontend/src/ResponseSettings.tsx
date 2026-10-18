@@ -1,7 +1,7 @@
-import { useEffect, useState } from "react";
+import { useEffect, useRef, useState } from "react";
 import { api, type Observation, type Task } from "./types";
 
-type Config = {
+export type ResponseConfig = {
   mode: "website" | "custom";
   status: number;
   format: "json" | "text" | "html";
@@ -9,9 +9,13 @@ type Config = {
   delay_ms: number;
   headers: { name: string; value: string }[];
 };
+export type ResponseDraft = {
+  config: ResponseConfig;
+  baseVersion: number;
+};
 type Saved = {
   version: number;
-  config: Config;
+  config: ResponseConfig;
   history: number[];
   state: { applied_version: number; error?: string } | null;
 };
@@ -19,6 +23,8 @@ type Saved = {
 export default function ResponseSettings({
   labId,
   nodeId,
+  draft,
+  onDraftChange,
   observation,
   stale,
   disabled,
@@ -27,6 +33,8 @@ export default function ResponseSettings({
 }: {
   labId: string;
   nodeId: string;
+  draft?: ResponseDraft;
+  onDraftChange: (draft?: ResponseDraft) => void;
   observation?: Observation;
   stale: boolean;
   disabled: boolean;
@@ -34,15 +42,33 @@ export default function ResponseSettings({
   apply: (version: number) => Promise<void>;
 }) {
   const [saved, setSaved] = useState<Saved | null>(null);
-  const [config, setConfig] = useState<Config | null>(null);
+  const [config, setConfig] = useState<ResponseConfig | null>(null);
+  const [draftBaseVersion, setDraftBaseVersion] = useState<number | null>(
+    draft?.baseVersion ?? null,
+  );
   const [error, setError] = useState("");
   const [working, setWorking] = useState(false);
+  const initialDraft = useRef(draft);
   const path = `/labs/${labId}/nodes/${nodeId}/response`;
   const load = async () => {
     const value = await api<Saved>(path);
     setSaved(value);
     setConfig(value.config);
+    setDraftBaseVersion(value.version);
+    onDraftChange(undefined);
     setError("");
+  };
+  const updateConfig = (next: ResponseConfig) => {
+    setConfig(next);
+    if (!saved) return;
+    if (JSON.stringify(next) === JSON.stringify(saved.config)) {
+      setDraftBaseVersion(saved.version);
+      onDraftChange(undefined);
+      return;
+    }
+    const baseVersion = draftBaseVersion ?? saved.version;
+    setDraftBaseVersion(baseVersion);
+    onDraftChange({ config: next, baseVersion });
   };
   useEffect(() => {
     let active = true;
@@ -50,7 +76,9 @@ export default function ResponseSettings({
       .then((value) => {
         if (active) {
           setSaved(value);
-          setConfig(value.config);
+          const cached = initialDraft.current;
+          setConfig(cached?.config ?? value.config);
+          setDraftBaseVersion(cached?.baseVersion ?? value.version);
         }
       })
       .catch((e) => {
@@ -80,11 +108,13 @@ export default function ResponseSettings({
       let value = saved;
       if (dirty || !saved.version) {
         value = await api<Saved>(path, "PUT", {
-          base_version: saved.version,
+          base_version: draftBaseVersion ?? saved.version,
           config,
         });
         setSaved(value);
         setConfig(value.config);
+        setDraftBaseVersion(value.version);
+        onDraftChange(undefined);
       }
       if (andApply) await apply(value.version);
     } catch (e) {
@@ -110,14 +140,14 @@ export default function ResponseSettings({
         </p>
       )}
       {config && (
-        <fieldset disabled={working}>
+        <fieldset disabled={working || disabled}>
           <label className="full-field">
             模式
             <select
               value={config.mode}
               disabled={working}
               onChange={(e) =>
-                setConfig({ ...config, mode: e.target.value as Config["mode"] })
+                updateConfig({ ...config, mode: e.target.value as ResponseConfig["mode"] })
               }
             >
               <option value="website">默认网站</option>
@@ -135,7 +165,7 @@ export default function ResponseSettings({
                     max={599}
                     value={config.status}
                     onChange={(e) =>
-                      setConfig({ ...config, status: Number(e.target.value) })
+                      updateConfig({ ...config, status: Number(e.target.value) })
                     }
                   />
                 </label>
@@ -147,7 +177,7 @@ export default function ResponseSettings({
                     max={10000}
                     value={config.delay_ms}
                     onChange={(e) =>
-                      setConfig({ ...config, delay_ms: Number(e.target.value) })
+                      updateConfig({ ...config, delay_ms: Number(e.target.value) })
                     }
                   />
                 </label>
@@ -157,9 +187,9 @@ export default function ResponseSettings({
                 <select
                   value={config.format}
                   onChange={(e) =>
-                    setConfig({
+                    updateConfig({
                       ...config,
-                      format: e.target.value as Config["format"],
+                      format: e.target.value as ResponseConfig["format"],
                     })
                   }
                 >
@@ -175,7 +205,7 @@ export default function ResponseSettings({
                   rows={8}
                   value={config.body}
                   onChange={(e) =>
-                    setConfig({ ...config, body: e.target.value })
+                    updateConfig({ ...config, body: e.target.value })
                   }
                 />
               </label>
@@ -184,7 +214,7 @@ export default function ResponseSettings({
                 <button
                   disabled={config.headers.length >= 32}
                   onClick={() =>
-                    setConfig({
+                    updateConfig({
                       ...config,
                       headers: [...config.headers, { name: "", value: "" }],
                     })
@@ -200,7 +230,7 @@ export default function ResponseSettings({
                     placeholder="名称"
                     value={h.name}
                     onChange={(e) =>
-                      setConfig({
+                      updateConfig({
                         ...config,
                         headers: config.headers.map((v, j) =>
                           j === i ? { ...v, name: e.target.value } : v,
@@ -213,7 +243,7 @@ export default function ResponseSettings({
                     placeholder="值"
                     value={h.value}
                     onChange={(e) =>
-                      setConfig({
+                      updateConfig({
                         ...config,
                         headers: config.headers.map((v, j) =>
                           j === i ? { ...v, value: e.target.value } : v,
@@ -224,7 +254,7 @@ export default function ResponseSettings({
                   <button
                     aria-label={`删除响应头 ${i + 1}`}
                     onClick={() =>
-                      setConfig({
+                      updateConfig({
                         ...config,
                         headers: config.headers.filter((_, j) => j !== i),
                       })
@@ -242,7 +272,7 @@ export default function ResponseSettings({
           </p>
           <div className="response-actions">
             <button
-              disabled={working || (!dirty && !!saved?.version)}
+              disabled={working || disabled || (!dirty && !!saved?.version)}
               onClick={() => void save(false)}
             >
               保存响应

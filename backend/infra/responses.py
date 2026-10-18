@@ -50,6 +50,8 @@ def save_response(lab_id: str, node_id: str, body: SaveResponse):
         raise HTTPException(422, str(exc)) from exc
     with db.connect() as con:
         con.execute("BEGIN IMMEDIATE")
+        if db.deleting(con, lab_id):
+            raise HTTPException(409, "实验正在删除")
         check_node(con, lab_id, node_id)
         previous = saved(con, lab_id, node_id)
         version = previous["version"] if previous else 0

@@ -1,4 +1,4 @@
-import { useCallback, useEffect, useRef, useState } from "react";
+import { lazy, Suspense, useCallback, useEffect, useMemo, useRef, useState } from "react";
 import {
   ReactFlow,
   Background,
@@ -11,10 +11,10 @@ import {
   type Connection,
 } from "@xyflow/react";
 import "@xyflow/react/dist/style.css";
-import Editor from "@monaco-editor/react";
-import ResponseSettings from "./ResponseSettings";
+import ResponseSettings, { type ResponseDraft } from "./ResponseSettings";
 import RedisPanel from "./RedisPanel";
-import ConfigDiff from "./ConfigDiff";
+const Editor = lazy(() => import("./MonacoEditor"));
+const ConfigDiff = lazy(() => import("./ConfigDiff"));
 import ClientPanel, { useClientRequests, eventName } from "./ClientPanel";
 import {
   Activity,
@@ -159,7 +159,9 @@ function ServiceNode({ data, selected }: NodeProps<Node<FlowData>>) {
 }
 function ClientNode({ data }: NodeProps<Node<FlowData>>) {
   return (
-    <div className="virtual-client">
+    <div
+      className={`virtual-client ${data.traceLabel?.startsWith("事后回放") ? "trace-highlight" : ""}`}
+    >
       <Handle type="source" position={Position.Right} isConnectable={false} />
       <span>客户端请求</span>
       <strong>客户端</strong>
@@ -205,6 +207,9 @@ export default function App() {
   }, []);
   const [labs, setLabs] = useState<Lab[]>([]);
   const [lab, setLab] = useState<Lab | null>(null);
+  const [responseDrafts, setResponseDrafts] = useState<
+    Record<string, ResponseDraft>
+  >({});
   const [topology, setTopology] = useState<Topology>(empty);
   const [measurements, setMeasurements] = useState<
     Record<string, { width: number; height: number }>
@@ -244,6 +249,12 @@ export default function App() {
   const [historyConfig, setHistoryConfig] = useState<string | null>(null);
   const [expandedEditor, setExpandedEditor] = useState(false);
   const [resultTaskId, setResultTaskId] = useState("");
+  const labNameCounts = useMemo(() => {
+    const counts = new Map<string, number>();
+    for (const item of labs)
+      counts.set(item.name, (counts.get(item.name) || 0) + 1);
+    return counts;
+  }, [labs]);
   const { screenToFlowPosition, fitView } = useReactFlow();
   useEffect(() => {
     const canvas = canvasRef.current;
@@ -270,6 +281,21 @@ export default function App() {
     return () => clearTimeout(timer);
   }, [lab?.id, topology.nodes.length, fitView]);
   const node = topology.nodes.find((n) => n.id === selected);
+  const redisDescendants = useMemo(() => {
+    const descendants = new Set<string>();
+    if (node?.kind !== "redis") return descendants;
+    const pending = topology.edges
+      .filter((edge) => edge.source === node.id)
+      .map((edge) => edge.target);
+    while (pending.length) {
+      const current = pending.pop()!;
+      if (descendants.has(current)) continue;
+      descendants.add(current);
+      for (const edge of topology.edges)
+        if (edge.source === current) pending.push(edge.target);
+    }
+    return descendants;
+  }, [node?.id, node?.kind, topology.edges]);
   const stale =
     !connected ||
     !lab?.observed_at ||
@@ -286,6 +312,14 @@ export default function App() {
   const resultTask =
     completedRuns.find((t) => t.id === resultTaskId) || completedRuns[0];
   const result = resultTask?.result;
+  const loadParamError =
+    !Number.isInteger(count) || count < 1 || count > 1000
+      ? "请求数需为 1–1000 的整数"
+      : !Number.isInteger(concurrency) || concurrency < 1 || concurrency > 20
+        ? "并发需为 1–20 的整数"
+        : !Number.isInteger(duration) || duration < 1 || duration > 60
+          ? "时限需为 1–60 秒的整数"
+          : "";
   const traceVisible = traceEnabled && !!clientStore.detail?.trace;
   const traceEvents = traceVisible ? clientStore.events : [];
   const traceCompletion = traceEvents.find((e) => e.kind === "nginx.completed");
@@ -293,6 +327,9 @@ export default function App() {
     (n) => n.id === clientStore.detail?.node_id,
   );
   const attempts = traceCompletion?.data.attempts || [];
+  const replayClientStep =
+    replay === 0 ||
+    (!!traceCompletion && replay === attempts.length + 2);
   useEffect(() => {
     if (!traceVisible || !traceTarget) return;
     const timer = setTimeout(() => {
@@ -300,15 +337,107 @@ export default function App() {
     }, 50);
     return () => clearTimeout(timer);
   }, [traceVisible, traceTarget?.id, fitView]);
-  const traceNodeLabels = new Map<string, string>();
-  for (const event of traceEvents)
-    if (event.node_id) traceNodeLabels.set(event.node_id, eventName(event));
-  if (replay >= 0 && traceVisible) {
-    traceNodeLabels.clear();
-    const current =
-      replay === 1 ? traceTarget?.id : attempts[replay - 2]?.node_id;
-    if (current) traceNodeLabels.set(current, "事后回放 · 已观测路径");
-  }
+  const traceNodeLabels = useMemo(() => {
+    const labels = new Map<string, string>();
+    for (const event of traceEvents)
+      if (event.node_id) labels.set(event.node_id, eventName(event));
+    if (replay >= 0 && traceVisible) {
+      labels.clear();
+      const current =
+        replay === 1
+          ? traceTarget?.id
+          : replay >= 2 && replay < attempts.length + 2
+            ? attempts[replay - 2]?.node_id
+            : undefined;
+      if (current) labels.set(current, "事后回放 · 已观测路径");
+    }
+    return labels;
+  }, [traceEvents, replay, traceVisible, traceTarget?.id, attempts]);
+  const flowNodes = useMemo(
+    () => [
+      ...topology.nodes.map((spec) => ({
+        id: spec.id,
+        type: "service",
+        position: spec.position,
+        measured: measurements[spec.id],
+        selected: selected === spec.id,
+        data: {
+          spec,
+          observation: lab?.observation?.nodes.find((n) => n.id === spec.id),
+          stale,
+          traceLabel: traceNodeLabels.get(spec.id),
+        },
+      })),
+      ...(traceVisible && traceTarget
+        ? [{
+            id: "__client",
+            type: "client",
+            position: { x: traceTarget.position.x - 270, y: traceTarget.position.y },
+            measured: measurements.__client,
+            draggable: false,
+            selectable: false,
+            data: {
+              spec: traceTarget,
+              stale: !clientStore.online,
+              traceLabel:
+                replay >= 0
+                  ? replayClientStep
+                    ? replay === 0
+                      ? "事后回放 · 客户端已发送"
+                      : clientStore.detail?.result?.error
+                        ? "事后回放 · 客户端请求失败"
+                        : "事后回放 · 客户端收到响应"
+                    : undefined
+                  : clientStore.online
+                    ? eventName(traceEvents.at(-1))
+                    : "观测断开 · 状态过期",
+            },
+          }]
+        : []),
+    ],
+    [topology.nodes, measurements, selected, lab?.observation, stale, traceNodeLabels, traceVisible, traceTarget, clientStore.online, traceEvents, replay, replayClientStep, clientStore.detail?.result?.error],
+  );
+  const flowEdges = useMemo(
+    () => [
+      ...topology.edges.map((e) => ({
+        id: `${e.source}-${e.target}`,
+        source: e.source,
+        target: e.target,
+        label: topology.nodes.find((n) => n.id === e.source)?.kind === "redis" ? "复制" : `w ${e.weight}`,
+        type: "smoothstep",
+        style: { stroke: "#638c7d", strokeWidth: 1.6 },
+        labelStyle: { fill: "#b7cbbf", fontSize: 11 },
+        labelBgStyle: { fill: "#18231e" },
+      })),
+      ...(traceVisible && traceTarget
+        ? [
+            {
+              id: "trace-client",
+              source: "__client",
+              target: traceTarget.id,
+              label: traceCompletion ? "日志已确认" : traceEvents.some((e) => e.kind === "client.sent") ? "已发起 · 入口待确认" : "等待发送",
+              type: "smoothstep",
+              style: { stroke: "#e6bf71", strokeWidth: 2, strokeDasharray: traceCompletion ? undefined : "5 5" },
+              labelStyle: { fill: "#e6bf71" },
+              labelBgStyle: { fill: "#18231e" },
+            },
+            ...attempts
+              .filter((a) => a.node_id && topology.nodes.some((n) => n.id === a.node_id))
+              .map((a, i) => ({
+                id: `trace-attempt-${i}`,
+                source: traceTarget.id,
+                target: a.node_id!,
+                label: `实际尝试 ${i + 1} · ${a.status}${a.mapping === "last_observed" ? " · 上次地址" : ""}`,
+                type: "smoothstep",
+                style: { stroke: "#e6bf71", strokeWidth: 3 },
+                labelStyle: { fill: "#e6bf71" },
+                labelBgStyle: { fill: "#18231e" },
+              })),
+          ]
+        : []),
+    ],
+    [topology.edges, topology.nodes, traceVisible, traceTarget, traceCompletion, traceEvents, attempts],
+  );
 
   const selectLab = useCallback((value: Lab) => {
     draftRevision.current = value.revision;
@@ -584,6 +713,9 @@ export default function App() {
           {labs.map((value) => (
             <option key={value.id} value={value.id}>
               {value.name}
+              {(labNameCounts.get(value.name) || 0) > 1
+                ? ` · ${value.id.slice(0, 8)}`
+                : ""}
             </option>
           ))}
           <optgroup label="实验操作">
@@ -806,7 +938,10 @@ export default function App() {
           className={`center dock-${dockMode}`}
           style={
             {
-              "--dock-size": dockMode === "collapsed" ? "44px" : `${dockSize}%`,
+              "--dock-size":
+                dockMode === "collapsed"
+                  ? "44px"
+                  : `max(${dockSize}%, clamp(330px, 34vh, 390px))`,
             } as React.CSSProperties
           }
         >
@@ -853,99 +988,8 @@ export default function App() {
             }}
           >
             <ReactFlow
-              nodes={[
-                ...topology.nodes.map((spec) => ({
-                  id: spec.id,
-                  type: "service",
-                  position: spec.position,
-                  measured: measurements[spec.id],
-                  selected: selected === spec.id,
-                  data: {
-                    spec,
-                    observation: lab?.observation?.nodes.find(
-                      (n) => n.id === spec.id,
-                    ),
-                    stale,
-                    traceLabel: traceNodeLabels.get(spec.id),
-                  },
-                })),
-                ...(traceVisible && traceTarget
-                  ? [
-                      {
-                        id: "__client",
-                        type: "client",
-                        position: {
-                          x: traceTarget.position.x - 270,
-                          y: traceTarget.position.y,
-                        },
-                        measured: measurements.__client,
-                        draggable: false,
-                        selectable: false,
-                        data: {
-                          spec: traceTarget,
-                          stale: !clientStore.online,
-                          traceLabel: clientStore.online
-                            ? eventName(traceEvents.at(-1))
-                            : "观测断开 · 状态过期",
-                        },
-                      },
-                    ]
-                  : []),
-              ]}
-              edges={[
-                ...topology.edges.map((e) => ({
-                  id: `${e.source}-${e.target}`,
-                  source: e.source,
-                  target: e.target,
-                  label:
-                    topology.nodes.find((n) => n.id === e.source)?.kind ===
-                    "redis"
-                      ? "复制"
-                      : `w ${e.weight}`,
-                  type: "smoothstep",
-                  style: { stroke: "#638c7d", strokeWidth: 1.6 },
-                  labelStyle: { fill: "#b7cbbf", fontSize: 11 },
-                  labelBgStyle: { fill: "#18231e" },
-                })),
-                ...(traceVisible && traceTarget
-                  ? [
-                      {
-                        id: "trace-client",
-                        source: "__client",
-                        target: traceTarget.id,
-                        label: traceCompletion
-                          ? "日志已确认"
-                          : traceEvents.some((e) => e.kind === "client.sent")
-                            ? "已发起 · 入口待确认"
-                            : "等待发送",
-                        type: "smoothstep",
-                        style: {
-                          stroke: "#e6bf71",
-                          strokeWidth: 2,
-                          strokeDasharray: traceCompletion ? undefined : "5 5",
-                        },
-                        labelStyle: { fill: "#e6bf71" },
-                        labelBgStyle: { fill: "#18231e" },
-                      },
-                      ...attempts
-                        .filter(
-                          (a) =>
-                            a.node_id &&
-                            topology.nodes.some((n) => n.id === a.node_id),
-                        )
-                        .map((a, i) => ({
-                          id: `trace-attempt-${i}`,
-                          source: traceTarget.id,
-                          target: a.node_id!,
-                          label: `实际尝试 ${i + 1} · ${a.status}${a.mapping === "last_observed" ? " · 上次地址" : ""}`,
-                          type: "smoothstep",
-                          style: { stroke: "#e6bf71", strokeWidth: 3 },
-                          labelStyle: { fill: "#e6bf71" },
-                          labelBgStyle: { fill: "#18231e" },
-                        })),
-                    ]
-                  : []),
-              ]}
+              nodes={flowNodes}
+              edges={flowEdges}
               nodeTypes={nodeTypes}
               onNodeClick={(_, n) => {
                 if (n.id !== "__client") setSelected(n.id);
@@ -1243,6 +1287,8 @@ export default function App() {
                       type="number"
                       min="1"
                       max="1000"
+                      step="1"
+                      aria-invalid={!Number.isInteger(count) || count < 1 || count > 1000}
                       value={count}
                       onChange={(e) => setCount(Number(e.target.value))}
                     />
@@ -1254,6 +1300,8 @@ export default function App() {
                       type="number"
                       min="1"
                       max="20"
+                      step="1"
+                      aria-invalid={!Number.isInteger(concurrency) || concurrency < 1 || concurrency > 20}
                       value={concurrency}
                       onChange={(e) => setConcurrency(Number(e.target.value))}
                     />
@@ -1265,12 +1313,14 @@ export default function App() {
                       type="number"
                       min="1"
                       max="60"
+                      step="1"
+                      aria-invalid={!Number.isInteger(duration) || duration < 1 || duration > 60}
                       value={duration}
                       onChange={(e) => setDuration(Number(e.target.value))}
                     />
                   </label>
                   <button
-                    disabled={!dockerReady || !loadTarget || busy || pending}
+                    disabled={!dockerReady || !loadTarget || busy || pending || !!loadParamError}
                     onClick={() =>
                       void safely(() =>
                         submit("load", lab, {
@@ -1286,6 +1336,11 @@ export default function App() {
                     发起请求
                   </button>
                 </div>
+                {loadParamError && (
+                  <p className="error" role="alert">
+                    {loadParamError}
+                  </p>
+                )}
                 {result ? (
                   <>
                     <label className="run-history">
@@ -1647,6 +1702,10 @@ export default function App() {
                           ?.source || ""
                       }
                       onChange={(event) => {
+                        if (redisDescendants.has(event.target.value)) {
+                          setError("复制关系不能形成环");
+                          return;
+                        }
                         const edges = topology.edges.filter(
                           (e) => e.target !== node.id,
                         );
@@ -1672,7 +1731,13 @@ export default function App() {
                       {topology.nodes
                         .filter((n) => n.kind === "redis" && n.id !== node.id)
                         .map((n) => (
-                          <option key={n.id}>{n.id}</option>
+                          <option
+                            key={n.id}
+                            value={n.id}
+                            disabled={redisDescendants.has(n.id)}
+                          >
+                            {n.id}{redisDescendants.has(n.id) ? "（会形成环）" : ""}
+                          </option>
                         ))}
                     </select>
                   </label>
@@ -1708,6 +1773,16 @@ export default function App() {
                       key={`${lab.id}:${node.id}`}
                       labId={lab.id}
                       nodeId={node.id}
+                      draft={responseDrafts[`${lab.id}:${node.id}`]}
+                      onDraftChange={(draft) => {
+                        const key = `${lab.id}:${node.id}`;
+                        setResponseDrafts((current) => {
+                          const next = { ...current };
+                          if (draft) next[key] = draft;
+                          else delete next[key];
+                          return next;
+                        });
+                      }}
                       observation={observation}
                       stale={stale}
                       disabled={busy || pending || !dockerReady}
@@ -1847,24 +1922,26 @@ export default function App() {
                     </button>
                   </div>
                   <div className="editor">
-                    <Editor
-                      theme="vs-dark"
-                      language="plaintext"
-                      path={node.id + ".conf"}
-                      value={node.config}
-                      onChange={(value) =>
-                        editNode({ config: value || "", mode: "manual" })
-                      }
-                      options={{
-                        minimap: { enabled: false },
-                        fontSize: 12,
-                        lineNumbersMinChars: 3,
-                        scrollBeyondLastLine: false,
-                        wordWrap: "on",
-                        readOnly: busy || pending,
-                        automaticLayout: true,
-                      }}
-                    />
+                    <Suspense fallback={<div className="editor-loading" />}>
+                      <Editor
+                        theme="vs-dark"
+                        language="plaintext"
+                        path={node.id + ".conf"}
+                        value={node.config}
+                        onChange={(value) =>
+                          editNode({ config: value || "", mode: "manual" })
+                        }
+                        options={{
+                          minimap: { enabled: false },
+                          fontSize: 12,
+                          lineNumbersMinChars: 3,
+                          scrollBeyondLastLine: false,
+                          wordWrap: "on",
+                          readOnly: busy || pending,
+                          automaticLayout: true,
+                        }}
+                      />
+                    </Suspense>
                   </div>
                   <p className="hint">
                     保存不会重载服务。应用时先执行 nginx -t，再确认新 worker
@@ -1956,7 +2033,9 @@ export default function App() {
                 <X size={18} />
               </button>
             </div>
-            <ConfigDiff original={node.config} modified={diff} />
+            <Suspense fallback={<div className="editor-loading" />}>
+              <ConfigDiff original={node.config} modified={diff} />
+            </Suspense>
             <div className="diff-actions">
               <button onClick={() => setDiff(null)}>保留当前配置</button>
               <button
@@ -2002,12 +2081,14 @@ export default function App() {
                 </button>
               ))}
             </div>
-            <Editor
-              height="60vh"
-              theme="vs-dark"
-              value={historyConfig || "选择版本查看保存的完整配置"}
-              options={{ readOnly: true, minimap: { enabled: false } }}
-            />
+            <Suspense fallback={<div className="editor-loading" />}>
+              <Editor
+                height="60vh"
+                theme="vs-dark"
+                value={historyConfig || "选择版本查看保存的完整配置"}
+                options={{ readOnly: true, minimap: { enabled: false } }}
+              />
+            </Suspense>
           </div>
         </div>
       )}
@@ -2023,21 +2104,23 @@ export default function App() {
                 <X size={18} />
               </button>
             </div>
-            <Editor
-              height="65vh"
-              theme="vs-dark"
-              path={node.id + ".expanded.conf"}
-              value={node.config}
-              onChange={(value) =>
-                editNode({ config: value || "", mode: "manual" })
-              }
-              options={{
-                fontSize: 14,
-                minimap: { enabled: false },
-                automaticLayout: true,
-                readOnly: busy || pending,
-              }}
-            />
+            <Suspense fallback={<div className="editor-loading" />}>
+              <Editor
+                height="65vh"
+                theme="vs-dark"
+                path={node.id + ".expanded.conf"}
+                value={node.config}
+                onChange={(value) =>
+                  editNode({ config: value || "", mode: "manual" })
+                }
+                options={{
+                  fontSize: 14,
+                  minimap: { enabled: false },
+                  automaticLayout: true,
+                  readOnly: busy || pending,
+                }}
+              />
+            </Suspense>
             <div className="diff-actions">
               <span className="hint">关闭后保留编辑；保存草稿不会部署。</span>
               <button onClick={() => setExpandedEditor(false)}>完成编辑</button>

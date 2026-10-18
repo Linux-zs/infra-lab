@@ -92,6 +92,8 @@ def save_draft(lab_id: str, body: SaveDraft):
         row = con.execute("SELECT revision FROM labs WHERE id=?", (lab_id,)).fetchone()
         if not row:
             raise HTTPException(404, "实验不存在")
+        if db.deleting(con, lab_id):
+            raise HTTPException(409, "实验正在删除")
         if row[0] != body.base_revision:
             raise HTTPException(409, "草稿已改变，请刷新后重试；本地编辑尚未覆盖")
         rev = row[0] + 1
@@ -135,6 +137,13 @@ def submit(lab_id: str, body: Action):
             if Action.model_validate(existing["payload"]["action"]).model_dump() != body.model_dump():
                 raise HTTPException(409, "同一请求标识不能用于不同操作")
             return existing
+        receipt = con.execute(
+            "SELECT action FROM task_receipts WHERE lab_id=? AND request_id=?", (lab_id, body.request_id)
+        ).fetchone()
+        if receipt:
+            if json.loads(receipt[0]) != body.model_dump():
+                raise HTTPException(409, "同一请求标识不能用于不同操作")
+            raise HTTPException(410, "任务详情已归档；重复请求未执行，请使用新的请求标识")
         if db.deleting(con, lab_id):
             raise HTTPException(409, "实验正在删除")
         if body.kind == "delete_lab" and con.execute("SELECT 1 FROM tasks WHERE lab_id=? AND status IN ('queued','running')", (lab_id,)).fetchone():
@@ -170,6 +179,10 @@ def submit(lab_id: str, body: Action):
             "INSERT INTO tasks(id,lab_id,request_id,kind,status,payload,created_at,updated_at) "
             "VALUES(?,?,?,?,?,?,?,?)",
             (task_id, lab_id, body.request_id, body.kind, "queued", json.dumps(payload), db.now(), db.now()),
+        )
+        con.execute(
+            "INSERT INTO task_receipts VALUES(?,?,?,?,?)",
+            (lab_id, body.request_id, task_id, json.dumps(body.model_dump()), db.now()),
         )
         if body.kind == "client_request":
             con.execute(

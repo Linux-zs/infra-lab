@@ -74,14 +74,19 @@ export function useClientRequests(labId?: string) {
   const [detail, setDetail] = useState<ClientRequest | null>(null);
   const [online, setOnline] = useState(false);
   const [error, setError] = useState("");
-  const [incoming, setIncoming] = useState<TraceEvent[]>([]);
+  const [activeIncoming, setActiveIncoming] = useState<TraceEvent[]>([]);
+  const eventCache = useRef(new Map<string, TraceEvent[]>());
   const cursor = useRef(0);
+  const active = ownerLab === labId ? selected || records[0]?.id || "" : "";
+  const activeRef = useRef(active);
+  activeRef.current = active;
   useEffect(() => {
     setOwnerLab(labId);
     setRecords([]);
     setSelected("");
     setDetail(null);
-    setIncoming([]);
+    setActiveIncoming([]);
+    eventCache.current.clear();
     setError("");
     cursor.current = 0;
     if (!labId) return;
@@ -94,7 +99,10 @@ export function useClientRequests(labId?: string) {
     }, 1000);
     const stream = new EventSource(`/api/labs/${labId}/requests/events`);
     stream.addEventListener("requests", (e) => {
-      setRecords(JSON.parse((e as MessageEvent).data));
+      const next: RequestSummary[] = JSON.parse((e as MessageEvent).data);
+      setRecords((previous) =>
+        JSON.stringify(previous) === JSON.stringify(next) ? previous : next,
+      );
       lastReceived = Date.now();
       setOnline(navigator.onLine);
     });
@@ -102,7 +110,12 @@ export function useClientRequests(labId?: string) {
       const value: TraceEvent = JSON.parse((e as MessageEvent).data);
       if (value.seq <= cursor.current) return;
       cursor.current = value.seq;
-      setIncoming((old) => [...old, value].slice(-5000));
+      const events = [...(eventCache.current.get(value.request_id) || []), value].slice(-500);
+      eventCache.current.delete(value.request_id);
+      eventCache.current.set(value.request_id, events);
+      while (eventCache.current.size > 100)
+        eventCache.current.delete(eventCache.current.keys().next().value!);
+      if (value.request_id === activeRef.current) setActiveIncoming(events);
     });
     stream.onerror = () => setOnline(false);
     return () => {
@@ -112,10 +125,10 @@ export function useClientRequests(labId?: string) {
       setOnline(false);
     };
   }, [labId]);
-  const active = ownerLab === labId ? selected || records[0]?.id || "" : "";
   const updated = records.find((r) => r.id === active)?.updated_at;
   useEffect(() => {
     setDetail(null);
+    setActiveIncoming(eventCache.current.get(active) || []);
   }, [labId, active]);
   useEffect(() => {
     if (!labId || !active) return;
@@ -140,11 +153,11 @@ export function useClientRequests(labId?: string) {
         ...new Map(
           [
             ...(detail?.id === active ? detail.events : []),
-            ...incoming.filter((e) => e.request_id === active),
+            ...activeIncoming,
           ].map((e) => [e.seq, e]),
         ).values(),
       ].sort((a, b) => a.seq - b.seq),
-    [detail, incoming, active],
+    [detail, activeIncoming, active],
   );
   return {
     records: ownerLab === labId ? records : [],
