@@ -117,7 +117,7 @@ class Runtime:
         self.client.close()
 
     def containers(self, lab_id):
-        return self.client.containers.list(all=True, filters=filters(lab_id))
+        return self.client.containers.list(all=True, filters=filters(lab_id), ignore_removed=True)
 
     def node(self, lab_id, node_id):
         found = [
@@ -277,7 +277,9 @@ class Runtime:
 
     def _apply_locked(self, lab_id, topology, task_id, emit):
         nodes = topology["nodes"]
-        owned = self.client.containers.list(all=True, filters={"label": f"infra.owner={OWNER}"})
+        owned = self.client.containers.list(
+            all=True, filters={"label": f"infra.owner={OWNER}"}, ignore_removed=True
+        )
         allocated = sum(container_memory(c) for c in owned if c.labels.get("infra.lab") != lab_id)
         lab_containers = [c for c in owned if c.labels.get("infra.lab") == lab_id]
         limit = int(os.getenv("INFRA_TOTAL_MEMORY_MB", "768")) * 1048576
@@ -437,7 +439,9 @@ class Runtime:
     def migrate_node_ip_history(self):
         from . import db
 
-        containers = self.client.containers.list(all=True, filters={"label": f"infra.owner={OWNER}"})
+        containers = self.client.containers.list(
+            all=True, filters={"label": f"infra.owner={OWNER}"}, ignore_removed=True
+        )
         owned = {
             c.id: (c.labels.get("infra.lab"), c.labels.get("infra.role"))
             for c in containers

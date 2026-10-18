@@ -106,7 +106,7 @@ def test_lifecycle_order_idempotency_partial_failure():
     runtime.ready = Mock()
     assert not runtime.lifecycle("one", True, lambda _: None)["partial_failure"]
     assert order == ["app-1", "app-2", "gateway"]
-    runtime.client.containers.list.assert_called_with(all=True, filters=filters("one"))
+    runtime.client.containers.list.assert_called_with(all=True, filters=filters("one"), ignore_removed=True)
     order.clear()
     for c in containers:
         c.status = "running"

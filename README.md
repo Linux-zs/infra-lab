@@ -90,6 +90,36 @@ backend\.venv\Scripts\python.exe scripts/acceptance.py --url http://127.0.0.1:80
 
 它创建专属实验，验证分流、改权重、无效配置保护、停机重试、慢响应、清理和重新部署。最后保留一个健康实验供检查；证据保存在忽略提交的 `artifacts/acceptance.json`。
 
+发布回归使用统一入口，先保持管理端口 8088 和网站端口 8089 的 SSH 隧道：
+
+```powershell
+backend\.venv\Scripts\python.exe scripts/release_acceptance.py --ssh-server root@YOUR_SERVER --output artifacts/release-check.json
+```
+
+脚本创建两个同名、独立标记的实验：主实验包含 Nginx、两个应用、三级 Redis 复制链；隔离对照实验包含一个运行中的应用。它验证真实网站、GET/POST 表单、静态资源、Cookie、单次请求、SSE 序号续传、自定义响应、处理中配置快照、独立发布、无效配置保护、Nginx 重载与 503 重试、Redis 复制和整套启停。相同任务会重复提交以检查去重，并核对原有实验草稿和容器是否变化。通过后保留测试实验，供浏览器检查；失败会记录原因并保留当时的资源。`--output` 必须使用新文件，避免覆盖旧证据。
+
+需要为新增的 7 个 64 MB 服务容器、校验容器和请求发生器预留额度；已停止实验容器也计入平台预算。额度不足时根据服务器资源调整 `INFRA_TOTAL_MEMORY_MB`，验收清理后恢复原值。验收期间避免从其他窗口修改原有实验，否则隔离检查会报告基线变化。
+
+响应边界检查使用主实验内的 Nginx 临时文件，验证网站完整返回 2 MiB、单次预览只保留 1 MiB、10 秒请求超时、真实 503 页面、上传限制和缺日志时的部分链路；完成后恢复原 Nginx 配置：
+
+```powershell
+backend\.venv\Scripts\python.exe scripts/release_acceptance.py --phase limits --ssh-server root@YOUR_SERVER --output artifacts/release-check.json
+```
+
+确认没有其他实验任务执行后，恢复阶段显式允许重启控制服务：
+
+```powershell
+backend\.venv\Scripts\python.exe scripts/release_acceptance.py --phase recovery --ssh-server root@YOUR_SERVER --allow-control-restart --output artifacts/release-check.json
+```
+
+这一步会依次中断 Worker 请求任务、重启 API、重启网站入口采集器，验证中断状态、历史恢复及 SSE 续传；管理页面和网站连接会短暂断开。浏览器检查完成后，使用同一份证据清理脚本创建的两个实验：
+
+```powershell
+backend\.venv\Scripts\python.exe scripts/release_acceptance.py --phase cleanup --ssh-server root@YOUR_SERVER --output artifacts/release-check.json
+```
+
+清理前核对实验 ID 和本轮生成的名称，清理后核对双标签匹配的容器与网络均为零，并再次比较原有实验。脚本不会清理其他实验；`--ssh-server` 只使用已有 SSH 配置或免密登录，不接收密码和私钥。API 或入口端口不同可通过 `--url`、`--portal-url` 指定。
+
 ## 接口
 
 交互式接口文档：`/docs`。核心接口：`/api/labs`、`/api/labs/{id}/draft`、`/revisions`、`/tasks`、`/events`、`/nodes/{node_id}/logs`。节点和连线作为带乐观版本检查的完整拓扑保存；任务使用 request_id 去重，保存提交时的拓扑快照。每实验最多保留 500 条完整终态任务记录；更早记录会归档为轻量去重凭据，同一请求标识不会因此被重复执行。SSE 负责观测，不根据画布连线伪造运行状态。

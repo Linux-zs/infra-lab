@@ -22,7 +22,9 @@ def test_cleanup_uses_both_ownership_labels(tmp_path, monkeypatch):
     runtime.client.containers.list.return_value = [container]
     runtime.client.networks.list.return_value = [network]
     runtime.cleanup("lab-a", lambda _: None)
-    runtime.client.containers.list.assert_called_once_with(all=True, filters=filters("lab-a"))
+    runtime.client.containers.list.assert_called_once_with(
+        all=True, filters=filters("lab-a"), ignore_removed=True
+    )
     runtime.client.networks.list.assert_called_once_with(filters=filters("lab-a"))
     assert filters("lab-a")["label"] == ["infra.owner=infra-lab-v1", "infra.lab=lab-a"]
     container.remove.assert_called_once_with(force=True)
@@ -34,6 +36,32 @@ def test_reject_foreign_network_name_collision():
     runtime.client.networks.get.return_value.attrs = {"Labels": labels("other-lab")}
     with pytest.raises(RuntimeError, match="冲突"):
         runtime.network("lab-a")
+
+
+def test_container_disappearing_during_docker_scan_is_ignored():
+    from docker.errors import NotFound
+    from docker.models.containers import ContainerCollection
+
+    runtime = runtime_with_mock()
+    runtime.client.api.containers.return_value = [{"Id": "deleted"}, {"Id": "alive"}]
+    runtime.client.api.inspect_container.side_effect = [NotFound("removed concurrently"), {"Id": "alive"}]
+    runtime.client.containers = ContainerCollection(runtime.client)
+    assert [container.id for container in runtime.containers("lab-a")] == ["alive"]
+
+
+def test_quota_scan_survives_concurrent_foreign_lab_deletion():
+    from docker.errors import NotFound
+    from docker.models.containers import ContainerCollection
+
+    runtime = runtime_with_mock()
+    runtime.client.api.containers.return_value = [{"Id": "foreign-deleted"}]
+    runtime.client.api.inspect_container.side_effect = NotFound("removed concurrently")
+    runtime.client.containers = ContainerCollection(runtime.client)
+    runtime.containers = Mock(return_value=[])
+    runtime.validate = Mock(side_effect=RuntimeError("validation reached"))
+    with pytest.raises(RuntimeError, match="validation reached"):
+        runtime.apply("lab-a", {"nodes": [{"id": "gateway", "kind": "nginx", "memory_mb": 64}]}, "task", lambda _: None)
+    runtime.validate.assert_called_once()
 
 
 def test_invalid_nginx_config_does_not_reload_existing_container():
