@@ -13,6 +13,8 @@ import {
 import "@xyflow/react/dist/style.css";
 import ResponseSettings, { type ResponseDraft } from "./ResponseSettings";
 import RedisPanel from "./RedisPanel";
+import ScenarioPanel from "./ScenarioPanel";
+import ScenarioCreate from "./ScenarioCreate";
 const Editor = lazy(() => import("./MonacoEditor"));
 const ConfigDiff = lazy(() => import("./ConfigDiff"));
 import ClientPanel, { useClientRequests, eventName } from "./ClientPanel";
@@ -229,14 +231,14 @@ export default function App() {
   const [error, setError] = useState("");
   const [realtime, setRealtime] = useState(false);
   const [panel, setPanel] = useState<
-    "client" | "requests" | "results" | "tasks" | "logs" | "redis"
+    "client" | "requests" | "results" | "tasks" | "logs" | "redis" | "scenario"
   >("client");
   const [traceEnabled, setTraceEnabled] = useState(false);
   const [replay, setReplay] = useState(-1);
   const clientStore = useClientRequests(lab?.id);
   const [logs, setLogs] = useState("选择已部署的节点，读取真实容器日志。");
   const [diff, setDiff] = useState<string | null>(null);
-  const [modal, setModal] = useState<"cleanup" | "delete" | "new" | null>(null);
+  const [modal, setModal] = useState<"cleanup" | "delete" | "new" | "scenario" | null>(null);
   const [name, setName] = useState("负载均衡实验");
   const [count, setCount] = useState(120);
   const [concurrency, setConcurrency] = useState(4);
@@ -451,6 +453,7 @@ export default function App() {
     setLogs("选择已部署的节点，读取真实容器日志。");
     setError("");
     setTraceEnabled(false);
+    setPanel(value.scenario_id ? "scenario" : "client");
   }, []);
   useEffect(() => {
     api<Lab[]>("/labs")
@@ -734,6 +737,9 @@ export default function App() {
           onClick={() => setModal("new")}
         >
           <Plus size={16} />
+        </button>
+        <button className="icon-button" title="从场景新建实验" aria-label="从场景新建实验" disabled={dirty || busy} onClick={() => setModal("scenario")}>
+          <FlaskConical size={17} />
         </button>
         {lab && (
           <span className="tag">
@@ -1128,6 +1134,7 @@ export default function App() {
               <div>
                 {(
                   [
+                    ...(lab?.scenario_id ? ["scenario" as const] : []),
                     "client",
                     "requests",
                     "redis",
@@ -1151,7 +1158,7 @@ export default function App() {
                     ) : (
                       <FileCode2 size={15} />
                     )}
-                    {key === "redis"
+                    {key === "scenario" ? "实验步骤" : key === "redis"
                       ? "Redis 读写"
                       : key === "client"
                         ? "客户端"
@@ -1174,6 +1181,26 @@ export default function App() {
                   : "尚未完成部署"}
               </span>
             </div>
+            {panel === "scenario" && lab?.scenario_id && <ScenarioPanel
+              key={lab.id} lab={lab} tasks={tasks} dirty={dirty} connected={connected}
+              disabled={!dockerReady || busy || pending} trace={traceEnabled}
+              newScenario={() => setModal("scenario")}
+              onTraceChange={value => safely(async () => {
+                const entries = await api<{id: string; node_id: string}[]>(`/labs/${lab.id}/entries`);
+                for (const entry of entries.filter(e => e.node_id === "gateway"))
+                  await api(`/labs/${lab.id}/entries/${entry.id}`, "PATCH", {trace: value});
+                setTraceEnabled(value);
+              })}
+              run={(step, parameters) => safely(async () => {
+                const task = await api<Task>(`/labs/${lab.id}/scenario/steps/${step}/run`, "POST", {base_revision: lab.revision, request_id: crypto.randomUUID(), ...parameters});
+                setTasks(values => [task, ...values]);
+                const updated = await api<Lab>(`/labs/${lab.id}`);
+                draftRevision.current = updated.revision;
+                setLab(updated); setTopology(updated.draft);
+                if (task.payload.scenario_plan?.measure === "request") clientStore.select(task.id);
+              })}
+              openRequest={id => {clientStore.select(id); setPanel("client"); setDockMode("normal");}}
+            />}
             {panel === "client" && (
               <ClientPanel
                 lab={lab}
@@ -1972,7 +1999,11 @@ export default function App() {
           {pending ? "实验任务执行中" : dirty ? "有未保存的编辑" : "工作台就绪"}
         </span>
       </footer>
-      {modal && (
+      {modal === "scenario" && <ScenarioCreate close={() => setModal(null)} created={created => {
+        setLabs(values => [...values.filter(v => v.id !== created.id), created]);
+        selectLab(created); setDockMode("normal"); setModal(null);
+      }} />}
+      {modal && modal !== "scenario" && (
         <div className="modal-backdrop">
           <div className="modal">
             <button

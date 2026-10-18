@@ -71,7 +71,8 @@ class SaveDraft(BaseModel):
 
 class Action(BaseModel):
     request_id: str = Field(min_length=8, max_length=80, pattern=r"^[a-zA-Z0-9-]+$")
-    kind: Literal["apply", "start", "stop", "cleanup", "load", "start_lab", "stop_lab", "client_request", "redis_command", "apply_response", "reload", "delete_lab"]
+    kind: Literal["apply", "start", "stop", "cleanup", "load", "start_lab", "stop_lab", "client_request", "redis_command", "apply_response", "reload", "delete_lab", "scenario_step"]
+    step_id: str | None = Field(default=None, pattern=r"^[a-z][a-z0-9-]{0,40}$")
     revision: int
     response_version: int | None = Field(default=None, ge=1)
     node_id: str | None = None

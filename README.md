@@ -193,10 +193,34 @@ AOF 每秒落盘，数据放在容器可写层；普通停止/启动保留数据
 
 界面分开显示未保存修改、已保存版本、运行版本与任务状态。保存使用版本冲突检测，运行版本来自真实健康探测；失败时回退，无法确认则显示未知。Worker 在原子发布后中断时，恢复后核对文件摘要与应用报告，不重放任务；任务仍可显示中断，但运行版本会独立更新。重建容器仅恢复已确认生效版本，不应用配置草稿。停止的应用不能发布配置。
 
-本功能使用应用镜像 `infra-lab-app:1.3.0`。旧应用需要用户主动“应用拓扑”升级；控制服务升级不自动重建实验。应用镜像构建上下文已改为仓库根目录：`docker build -f services/app/Dockerfile -t infra-lab-app:1.3.0 .`，部署脚本已更新。版本校验代码由控制后端与应用镜像共享。
+当前应用镜像为 `infra-lab-app:1.3.1`。旧应用需要用户主动“应用拓扑”升级；控制服务升级不自动重建实验。应用镜像构建上下文为仓库根目录：`docker build -f services/app/Dockerfile -t infra-lab-app:1.3.1 .`，部署脚本已更新。版本校验代码由控制后端与应用镜像共享。1.3.1 的请求发生器优先读取 `X-Infra-Node`，使 HTML 和自定义响应也能统计实例分布；缺少标识时明确计入未确认数量，兼容旧 JSON 实例字段。
 
 接口：`GET/PUT /api/labs/{lab}/nodes/{node}/response`，PUT 包含 `base_version` 与 `config`；任务 `apply_response` 包含 `node_id` 和 `response_version`，引用固定的已保存版本。响应配置独立于拓扑版本，增量建表保留旧历史。自定义响应和响应头属于用户配置，会保存在服务端数据库中，请只使用实验数据。
 
 Nginx 检查器新增“重载”：校验并重载当前容器内配置，不提交草稿。只有正在运行且观测有效时可点击；校验错误保留现有运行服务。任务类型为 `reload`。节点及整套实验启停按钮按真实状态禁用无效操作，状态过期或任务执行中时禁用。
 
 `scripts/response_acceptance.py` 验证真实响应与热更新；`scripts/response_recovery.py` 会短暂暂停其专属验收应用进程并重启本项目 Worker，验证回退与中断恢复，应在没有其他任务时执行。两者的验收实验结束后通过平台清理。
+
+## 场景实验
+
+工具栏烧瓶按钮“从场景新建实验”提供四个场景：Nginx 权重分流、故障与重试、延迟与超时、Redis 主从复制。创建只保存独立实验草稿；核对拓扑后点击“应用拓扑”才创建真实容器。旧实验不自动增加步骤或重建。每个场景节点使用 64 MB，仍受服务器实验总预算限制。
+
+部署后打开下方“实验步骤”，选择步骤并执行。步骤会按所列内容实际发布响应、应用权重或 Nginx 配置、启停节点并测量；它们会改变该实验的运行状态。批量分流可设置请求数 1–1000、并发 1–20、时限 1–60 秒。分布、错误率和延迟来自实际响应，达到时限时完成数可能小于请求数，不保证预定比例。单次步骤固定 GET /page、10 秒客户端时限；限速步骤让应用先完成写出，再观察客户端尚未收完正文即超时。
+
+“请求链路”默认关闭，与客户端共用开关；开启后单次步骤可在完成前查看已确认的应用事件，完成后通过“查看请求”在画布核对真实重试路径。批量请求不生成逐请求动画。Redis 步骤使用固定实验键 `scenario:{实验 ID}`，可以设置测试值；写入后立即读取，异步复制未完成时保留真实 nil。停止主节点不会自动选主。
+
+每次执行固定提交时的步骤、参数和目标版本，复用持久化串行队列和请求去重。历史保留最近 100 次终态执行，可选择两次结果对比，并展开执行前后实际运行配置、观测时间及已完成动作。刷新或 API 重启不会清空历史；Worker 中断标记未知，保留已确认部分，不自动重发。操作任务完成与 HTTP 请求成功分别展示，504 或客户端超时可以是一次成功执行步骤所得的真实结果。
+
+步骤不会覆盖尚未应用的无关拓扑或响应草稿。改动节点结构、手写 Nginx 配置或保留待应用响应时，相关步骤会报告冲突，需先处理修改或新建场景实验。手动操作仍使用原检查器。清理运行资源保留场景草稿和历史；删除实验才删除关联场景记录。
+
+接口：`GET /api/scenarios`、`POST /api/scenarios/{template_id}/labs`（`request_id`、可选 `name`）、`GET /api/labs/{id}/scenario`、`POST /api/labs/{id}/scenario/steps/{step_id}/run`（`base_revision`、`request_id` 及测量参数）。目录仅在服务端定义，创建时冻结模板版本；浏览器不能提交步骤命令。
+
+独立真实验收分三阶段，使用同一证据文件，core 完成后保留实验供浏览器检查：
+
+```powershell
+backend\.venv\Scripts\python.exe scripts/scenario_acceptance.py --phase core --ssh-server root@YOUR_SERVER --output artifacts/scenario-check.json
+backend\.venv\Scripts\python.exe scripts/scenario_acceptance.py --phase recovery --ssh-server root@YOUR_SERVER --allow-control-restart --output artifacts/scenario-check.json
+backend\.venv\Scripts\python.exe scripts/scenario_acceptance.py --phase cleanup --ssh-server root@YOUR_SERVER --output artifacts/scenario-check.json
+```
+
+恢复阶段会重启本项目 Worker 和 API，应确认没有其他实验任务执行；清理阶段只删除本轮 ID、名称匹配的实验，并核对双标签资源归零和原有实验未改变。四个场景同时部署需至少 768 MB，加上已有实验预算可能需要临时增加 `INFRA_TOTAL_MEMORY_MB`；验收结束应恢复原配额。

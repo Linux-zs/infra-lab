@@ -105,7 +105,7 @@ class Runtime:
         self.client.ping()
         self.nginx_image = os.getenv("INFRA_NGINX_IMAGE", "nginx:1.28.0-alpine")
         self.redis_image = os.getenv("INFRA_REDIS_IMAGE", "redis:7.4.7-alpine")
-        self.app_image = os.getenv("INFRA_APP_IMAGE", "infra-lab-app:1.3.0")
+        self.app_image = os.getenv("INFRA_APP_IMAGE", "infra-lab-app:1.3.1")
 
     def image_for(self, kind):
         return {"nginx": self.nginx_image, "app": self.app_image, "redis": self.redis_image}[kind]

@@ -46,6 +46,7 @@ export type Observation = {
 };
 export type Lab = {
   id: string;
+  scenario_id?: string | null;
   name: string;
   revision: number;
   draft: Topology;
@@ -55,6 +56,8 @@ export type Lab = {
   observed_at: number | null;
 };
 export type LoadResult = {
+  identified?: number;
+  unidentified?: number;
   completed: number;
   requested: number;
   errors: number;
@@ -80,6 +83,7 @@ export type Task = {
   status: string;
   created_at: number;
   payload: {
+    scenario_plan?: { measure: "load" | "request" | "redis" };
     action: {
       revision: number;
       node_id?: string;

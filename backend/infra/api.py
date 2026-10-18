@@ -15,6 +15,7 @@ from .entries import router as entries_router
 from .models import Action, SaveDraft, normalize, render_config
 from .responses import router as responses_router
 from .responses import saved
+from .scenarios import router as scenarios_router
 
 
 @asynccontextmanager
@@ -26,6 +27,7 @@ async def lifespan(app):
 app = FastAPI(title="Infra Lab", lifespan=lifespan)
 app.include_router(entries_router)
 app.include_router(responses_router)
+app.include_router(scenarios_router)
 app.add_middleware(
     TrustedHostMiddleware,
     allowed_hosts=os.getenv("INFRA_ALLOWED_HOSTS", "localhost,127.0.0.1,testserver").split(","),
@@ -43,7 +45,7 @@ async def same_origin(request: Request, call_next):
 
 def get_lab(lab_id):
     with db.connect() as con:
-        lab = db.unpack(con.execute("SELECT * FROM labs WHERE id=?", (lab_id,)).fetchone())
+        lab = db.unpack(con.execute("SELECT labs.*,s.template_id AS scenario_id FROM labs LEFT JOIN lab_scenarios s ON s.lab_id=labs.id WHERE labs.id=?", (lab_id,)).fetchone())
     if not lab:
         raise HTTPException(404, "实验不存在")
     return lab
@@ -64,7 +66,7 @@ class CreateLab(BaseModel):
 @app.get("/api/labs")
 def labs():
     with db.connect() as con:
-        return [db.unpack(r) for r in con.execute("SELECT * FROM labs ORDER BY created_at")]
+        return [db.unpack(r) for r in con.execute("SELECT labs.*,s.template_id AS scenario_id FROM labs LEFT JOIN lab_scenarios s ON s.lab_id=labs.id ORDER BY labs.created_at")]
 
 
 @app.post("/api/labs", status_code=201)
@@ -123,6 +125,8 @@ def revisions(lab_id: str):
 
 @app.post("/api/labs/{lab_id}/tasks", status_code=202)
 def submit(lab_id: str, body: Action):
+    if body.kind == "scenario_step":
+        raise HTTPException(422, "请通过实验步骤接口提交场景任务")
     with db.connect() as con:
         con.execute("BEGIN IMMEDIATE")
         lab = db.unpack(con.execute("SELECT * FROM labs WHERE id=?", (lab_id,)).fetchone())
@@ -141,7 +145,7 @@ def submit(lab_id: str, body: Action):
             "SELECT action FROM task_receipts WHERE lab_id=? AND request_id=?", (lab_id, body.request_id)
         ).fetchone()
         if receipt:
-            if json.loads(receipt[0]) != body.model_dump():
+            if Action.model_validate(json.loads(receipt[0])).model_dump() != body.model_dump():
                 raise HTTPException(409, "同一请求标识不能用于不同操作")
             raise HTTPException(410, "任务详情已归档；重复请求未执行，请使用新的请求标识")
         if db.deleting(con, lab_id):

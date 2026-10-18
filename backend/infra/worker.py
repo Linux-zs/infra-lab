@@ -21,6 +21,7 @@ def claim():
         )
         if task:
             con.execute("UPDATE tasks SET status='running',updated_at=? WHERE id=?", (db.now(), task["id"]))
+            con.execute("UPDATE scenario_runs SET status='running' WHERE task_id=?", (task["id"],))
         return task
 
 
@@ -32,6 +33,10 @@ def execute(task, runtime):
         db.log(task_id, message)
 
     emit(f"开始 {task['kind']}，草稿版本 {action['revision']}")
+    if task["kind"] == "scenario_step":
+        from .scenario_runtime import execute_step
+
+        return execute_step(task, runtime, emit)
     if task["kind"] == "apply":
         runtime.apply(lab_id, task["payload"]["topology"], task_id, emit)
         with db.connect() as con:
@@ -105,14 +110,17 @@ def recover():
     for task_id in ids:
         db.log(task_id, "Worker 上次执行中断；未自动重放。资源会重新探测，请核对后重新应用。")
         db.finish(task_id, "interrupted")
-        db.request_event(
-            task_id,
-            "worker",
-            "worker.interrupted",
-            evidence="observed",
-            data={"message": "Worker 中断；应用是否完成未知，未自动重发请求"},
-        )
-        db.request_status(task_id, "interrupted", {"error": "Worker 中断，未自动重发；应用状态未知"})
+        fail_pending_request(task_id, "interrupted", "worker.interrupted", "Worker 中断，未自动重发；应用后续状态未知")
+
+
+def fail_pending_request(task_id, status, kind, message):
+    # A scenario may finish HTTP measurement before its final observation fails.
+    # Preserve that already-confirmed response while reporting the task failure.
+    with db.connect() as con:
+        row = con.execute("SELECT status FROM client_requests WHERE id=?", (task_id,)).fetchone()
+    if row and row[0] in ("queued", "running"):
+        db.request_event(task_id, "worker", kind, evidence="observed", data={"message": message})
+        db.request_status(task_id, status, {"error": message})
 
 
 def heartbeat(available, error=None):
@@ -140,8 +148,7 @@ def run_task(task):
     except Exception as exc:
         db.log(task["id"], f"失败：{exc}。可能存在已完成步骤；保留现场。")
         db.finish(task["id"], "failed", {"error": str(exc)})
-        db.request_event(task["id"], "worker", "worker.failed", data={"error": str(exc)})
-        db.request_status(task["id"], "failed", {"error": str(exc)})
+        fail_pending_request(task["id"], "failed", "worker.failed", str(exc))
     finally:
         stop.set()
         thread.join()

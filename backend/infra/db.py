@@ -89,6 +89,18 @@ def init():
         CREATE TABLE IF NOT EXISTS browser_requests (
           request_id TEXT PRIMARY KEY, entry_id TEXT NOT NULL, method TEXT NOT NULL
         );
+        CREATE TABLE IF NOT EXISTS lab_scenarios (
+          lab_id TEXT PRIMARY KEY, template_id TEXT NOT NULL, definition TEXT NOT NULL
+        );
+        CREATE TABLE IF NOT EXISTS scenario_creations (
+          request_id TEXT PRIMARY KEY, signature TEXT NOT NULL, lab_id TEXT
+        );
+        CREATE TABLE IF NOT EXISTS scenario_runs (
+          task_id TEXT PRIMARY KEY, lab_id TEXT NOT NULL, step_id TEXT NOT NULL,
+          status TEXT NOT NULL, parameters TEXT NOT NULL, snapshot TEXT NOT NULL,
+          result TEXT, created_at REAL NOT NULL, finished_at REAL
+        );
+        CREATE INDEX IF NOT EXISTS scenario_runs_lab ON scenario_runs(lab_id,created_at DESC);
         """)
         # Preserve request deduplication after bulky task details are pruned.
         for row in con.execute("SELECT lab_id,request_id,id,payload,created_at FROM tasks"):
@@ -103,7 +115,7 @@ def unpack(row):
     if row is None:
         return None
     data = dict(row)
-    for field in ("draft", "applied", "observation", "payload", "logs", "result", "topology", "data"):
+    for field in ("draft", "applied", "observation", "payload", "logs", "result", "topology", "data", "definition", "parameters", "snapshot"):
         if field in data and data[field] is not None:
             data[field] = json.loads(data[field])
     return data
@@ -126,6 +138,18 @@ def finish(task_id, status, result=None):
             (status, json.dumps(result), now(), task_id),
         )
         row = con.execute("SELECT lab_id FROM tasks WHERE id=?", (task_id,)).fetchone()
+        run = con.execute("SELECT result FROM scenario_runs WHERE task_id=?", (task_id,)).fetchone()
+        if run:
+            combined = json.loads(run[0] or '{}')
+            combined.update(result or {})
+            if status == "interrupted":
+                combined.setdefault("error", "Worker 中断；已完成步骤保留，后续状态未知，未自动重放")
+            con.execute("UPDATE scenario_runs SET status=?,result=?,finished_at=? WHERE task_id=?",
+                        (status, json.dumps(combined), now(), task_id))
+            con.execute("DELETE FROM scenario_runs WHERE lab_id=(SELECT lab_id FROM scenario_runs WHERE task_id=?) "
+                        "AND status NOT IN ('queued','running') AND task_id NOT IN ("
+                        "SELECT task_id FROM scenario_runs WHERE lab_id=(SELECT lab_id FROM scenario_runs WHERE task_id=?) "
+                        "AND status NOT IN ('queued','running') ORDER BY created_at DESC LIMIT 100)", (task_id, task_id))
         if row and status not in ("queued", "running"):
             prune_tasks(con, row[0])
 
@@ -197,7 +221,8 @@ def erase_lab(lab_id):
     with connect() as con:
         con.execute("BEGIN IMMEDIATE")
         con.execute("DELETE FROM browser_requests WHERE request_id IN (SELECT id FROM client_requests WHERE lab_id=?)", (lab_id,))
-        for table in ("request_events", "client_requests", "entries", "response_versions", "response_state", "revisions", "tasks", "task_receipts"):
+        for table in ("request_events", "client_requests", "entries", "response_versions", "response_state", "revisions", "tasks", "task_receipts", "lab_scenarios", "scenario_runs"):
             con.execute(f"DELETE FROM {table} WHERE lab_id=?", (lab_id,))
         con.execute("DELETE FROM labs WHERE id=?", (lab_id,))
+        con.execute("UPDATE scenario_creations SET lab_id=NULL WHERE lab_id=?", (lab_id,))
         con.execute("DELETE FROM meta WHERE key LIKE ?", (f"node-ip-v2:{lab_id}:%",))

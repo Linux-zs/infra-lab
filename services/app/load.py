@@ -9,6 +9,8 @@ import time
 import urllib.error
 import urllib.request
 
+from load_identity import response_node
+
 host, count, concurrency, duration, run_id = sys.argv[1:]
 count, concurrency, duration = int(count), int(concurrency), int(duration)
 deadline = time.monotonic() + duration
@@ -44,10 +46,7 @@ def worker():
             with response:
                 code = response.code
                 raw = response.read(65536)
-            try:
-                node = json.loads(raw).get("node")
-            except (ValueError, AttributeError):
-                pass
+                node = response_node(response.headers, raw)
         except Exception as exc:
             error = str(exc)
         sample = {
@@ -74,6 +73,8 @@ print(
             "error_rate": errors / len(results) if results else None,
             "p95_ms": latencies[min(len(latencies) - 1, int(len(latencies) * 0.95))] if latencies else None,
             "distribution": dict(collections.Counter(r["node"] for r in results if r["node"])),
+            "identified": sum(bool(r["node"]) for r in results),
+            "unidentified": sum(not r["node"] for r in results),
             "samples": results,
         }
     )
